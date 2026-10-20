@@ -2,18 +2,13 @@ import type { ProxyConfig } from '../types';
 
 export const DEFAULT_PROXIES: ProxyConfig[] = [
   {
-    name: 'AllOrigins',
+    name: 'AllOrigins JSON',
+    template: 'https://api.allorigins.win/get?url={url}',
+    enabled: true
+  },
+  {
+    name: 'AllOrigins Raw',
     template: 'https://api.allorigins.win/raw?url={url}',
-    enabled: true
-  },
-  {
-    name: 'corsproxy.io',
-    template: 'https://corsproxy.io/?{url}',
-    enabled: true
-  },
-  {
-    name: 'cors.sh',
-    template: 'https://cors.sh/{url}',
     enabled: true
   }
 ];
@@ -29,39 +24,62 @@ export interface FetchResult {
   usedProxy?: string;
 }
 
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 15000): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    return response;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 export async function fetchWithCorsProxy(
   url: string,
   proxies: ProxyConfig[],
   customProxyUrl?: string,
-  signal?: AbortSignal
+  _signal?: AbortSignal
 ): Promise<FetchResult> {
-  // Try direct fetch first
+  const errors: string[] = [];
+
+  // Try direct fetch first (works for feeds with CORS headers like Designboom, NYTimes)
   try {
-    const response = await fetch(url, {
-      signal,
+    const response = await fetchWithTimeout(url, {
       headers: {
         'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*'
       }
-    });
+    }, 10000);
+    
     if (response.ok) {
       const text = await response.text();
-      return { ok: true, text };
+      if (text && text.length > 100) {
+        return { ok: true, text };
+      }
     }
-  } catch {
-    // Direct fetch failed, try proxies
+    errors.push(`Direct: ${response.status}`);
+  } catch (e) {
+    errors.push('Direct: CORS blocked');
   }
 
   // Try custom proxy if set
   if (customProxyUrl) {
     try {
       const proxyUrl = buildProxyUrl(customProxyUrl, url);
-      const response = await fetch(proxyUrl, { signal });
+      const response = await fetchWithTimeout(proxyUrl, {}, 15000);
       if (response.ok) {
         const text = await response.text();
-        return { ok: true, text, usedProxy: 'custom' };
+        if (text && text.length > 100) {
+          return { ok: true, text, usedProxy: 'custom' };
+        }
       }
-    } catch {
-      // Custom proxy failed
+      errors.push(`Custom proxy: ${response.status}`);
+    } catch (e) {
+      errors.push('Custom proxy: failed');
     }
   }
 
@@ -70,17 +88,41 @@ export async function fetchWithCorsProxy(
   for (const proxy of enabledProxies) {
     try {
       const proxyUrl = buildProxyUrl(proxy.template, url);
-      const response = await fetch(proxyUrl, { signal });
+      const response = await fetchWithTimeout(proxyUrl, {}, 15000);
+      
       if (response.ok) {
-        const text = await response.text();
-        return { ok: true, text, usedProxy: proxy.name };
+        let text = await response.text();
+        
+        // AllOrigins JSON endpoint returns { contents: "...", status: {...} }
+        if (proxy.name.includes('JSON') && text.startsWith('{')) {
+          try {
+            const json = JSON.parse(text);
+            if (json.contents) {
+              text = json.contents;
+            }
+          } catch {
+            // Not JSON, use as-is
+          }
+        }
+        
+        if (text && text.length > 100 && !text.includes('Cloudflare') && !text.includes('Enable JavaScript')) {
+          return { ok: true, text, usedProxy: proxy.name };
+        }
+        errors.push(`${proxy.name}: blocked/challenge`);
+      } else {
+        errors.push(`${proxy.name}: ${response.status}`);
       }
-    } catch {
-      // This proxy failed, try next
+    } catch (e) {
+      errors.push(`${proxy.name}: timeout/error`);
     }
   }
 
-  return { ok: false, error: 'All fetch attempts failed' };
+  // Provide detailed error message
+  const errorDetails = errors.join(', ');
+  return { 
+    ok: false, 
+    error: `Could not fetch feed. This feed may not support cross-origin requests. Try deploying your own CORS proxy (see Settings). Details: ${errorDetails}`
+  };
 }
 
 export async function fetchImageWithProxy(
