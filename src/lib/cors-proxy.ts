@@ -1,4 +1,5 @@
 import type { ProxyConfig } from '../types';
+import { CORS_PROXY_URL } from '../config';
 
 export const DEFAULT_PROXIES: ProxyConfig[] = [
   {
@@ -46,8 +47,37 @@ export async function fetchWithCorsProxy(
   _signal?: AbortSignal
 ): Promise<FetchResult> {
   const errors: string[] = [];
+  
+  const effectiveProxyUrl = customProxyUrl || CORS_PROXY_URL;
 
-  // Try direct fetch first (works for feeds with CORS headers like Designboom, NYTimes)
+  // 1. Try custom/configured proxy FIRST (most reliable when deployed)
+  if (effectiveProxyUrl) {
+    try {
+      const proxyUrl = buildProxyUrl(effectiveProxyUrl + '?url={url}', url);
+      const response = await fetchWithTimeout(proxyUrl, {}, 20000);
+      if (response.ok) {
+        const text = await response.text();
+        if (text && text.length > 100 && !text.includes('"error"')) {
+          return { ok: true, text, usedProxy: 'custom' };
+        }
+        if (text.includes('"error"')) {
+          try {
+            const errJson = JSON.parse(text);
+            errors.push(`Proxy: ${errJson.error || 'unknown error'}`);
+          } catch {
+            errors.push(`Proxy: invalid response`);
+          }
+        }
+      } else {
+        errors.push(`Proxy: ${response.status}`);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'failed';
+      errors.push(`Proxy: ${msg}`);
+    }
+  }
+
+  // 2. Try direct fetch (works for feeds with CORS headers)
   try {
     const response = await fetchWithTimeout(url, {
       headers: {
@@ -62,28 +92,11 @@ export async function fetchWithCorsProxy(
       }
     }
     errors.push(`Direct: ${response.status}`);
-  } catch (e) {
+  } catch {
     errors.push('Direct: CORS blocked');
   }
 
-  // Try custom proxy if set
-  if (customProxyUrl) {
-    try {
-      const proxyUrl = buildProxyUrl(customProxyUrl, url);
-      const response = await fetchWithTimeout(proxyUrl, {}, 15000);
-      if (response.ok) {
-        const text = await response.text();
-        if (text && text.length > 100) {
-          return { ok: true, text, usedProxy: 'custom' };
-        }
-      }
-      errors.push(`Custom proxy: ${response.status}`);
-    } catch (e) {
-      errors.push('Custom proxy: failed');
-    }
-  }
-
-  // Try each enabled proxy in order
+  // 3. Try public proxies as last resort fallback
   const enabledProxies = proxies.filter(p => p.enabled);
   for (const proxy of enabledProxies) {
     try {
@@ -112,17 +125,20 @@ export async function fetchWithCorsProxy(
       } else {
         errors.push(`${proxy.name}: ${response.status}`);
       }
-    } catch (e) {
+    } catch {
       errors.push(`${proxy.name}: timeout/error`);
     }
   }
 
-  // Provide detailed error message
   const errorDetails = errors.join(', ');
-  return { 
-    ok: false, 
-    error: `Could not fetch feed. This feed may not support cross-origin requests. Try deploying your own CORS proxy (see Settings). Details: ${errorDetails}`
-  };
+  const hasCustomProxy = Boolean(effectiveProxyUrl);
+  
+  let errorMsg = `Could not fetch feed. ${errorDetails}`;
+  if (!hasCustomProxy) {
+    errorMsg += '. Deploy the Cloudflare Worker proxy for better reliability (see Settings).';
+  }
+  
+  return { ok: false, error: errorMsg };
 }
 
 export async function fetchImageWithProxy(
@@ -131,6 +147,8 @@ export async function fetchImageWithProxy(
   customProxyUrl?: string,
   signal?: AbortSignal
 ): Promise<{ ok: boolean; blob?: Blob; error?: string }> {
+  const effectiveProxyUrl = customProxyUrl || CORS_PROXY_URL;
+  
   // Try direct fetch first
   try {
     const response = await fetch(url, { signal, mode: 'cors' });
@@ -139,14 +157,13 @@ export async function fetchImageWithProxy(
       return { ok: true, blob };
     }
   } catch {
-    // Direct fetch failed
+    // Direct fetch failed, try proxy
   }
 
-  // For images, we usually don't need proxies as most image CDNs have proper CORS
-  // But provide fallback anyway
-  if (customProxyUrl) {
+  // Try proxy for hotlink-protected images
+  if (effectiveProxyUrl) {
     try {
-      const proxyUrl = buildProxyUrl(customProxyUrl, url);
+      const proxyUrl = `${effectiveProxyUrl}?type=image&url=${encodeURIComponent(url)}`;
       const response = await fetch(proxyUrl, { signal });
       if (response.ok) {
         const blob = await response.blob();

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useInView } from 'react-intersection-observer';
 import type { FeedImage } from '../types';
 
@@ -9,8 +9,22 @@ interface MasonryGridProps {
 
 const BATCH_SIZE = 40;
 
+interface LayoutItem {
+  image: FeedImage;
+  index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
   const [displayCount, setDisplayCount] = useState(BATCH_SIZE);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const [layout, setLayout] = useState<LayoutItem[]>([]);
+  const [containerHeight, setContainerHeight] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const loadedAspectRatios = useRef<Map<string, number>>(new Map());
 
   const { ref: bottomRef, inView } = useInView({
     threshold: 0,
@@ -27,7 +41,81 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
     setDisplayCount(BATCH_SIZE);
   }, [images]);
 
-  const displayedImages = images.slice(0, displayCount);
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const updateWidth = () => {
+      setContainerWidth(container.offsetWidth);
+    };
+
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(container);
+
+    return () => observer.disconnect();
+  }, []);
+
+  const columnCount = useMemo(() => {
+    if (containerWidth < 480) return 2;
+    if (containerWidth < 768) return 3;
+    if (containerWidth < 1024) return 4;
+    return 5;
+  }, [containerWidth]);
+
+  const columnWidth = useMemo(() => {
+    if (containerWidth === 0) return 0;
+    return containerWidth / columnCount;
+  }, [containerWidth, columnCount]);
+
+  const displayedImages = useMemo(() => 
+    images.slice(0, displayCount),
+    [images, displayCount]
+  );
+
+  const calculateLayout = useCallback(() => {
+    if (columnWidth === 0 || displayedImages.length === 0) {
+      setLayout([]);
+      setContainerHeight(0);
+      return;
+    }
+
+    const columnHeights = new Array(columnCount).fill(0);
+    const items: LayoutItem[] = [];
+
+    displayedImages.forEach((image, index) => {
+      const cachedRatio = loadedAspectRatios.current.get(image.id);
+      const aspectRatio = cachedRatio || 1;
+      const height = columnWidth / aspectRatio;
+
+      const shortestColumn = columnHeights.indexOf(Math.min(...columnHeights));
+      
+      items.push({
+        image,
+        index,
+        x: shortestColumn * columnWidth,
+        y: columnHeights[shortestColumn],
+        width: columnWidth,
+        height
+      });
+
+      columnHeights[shortestColumn] += height;
+    });
+
+    setLayout(items);
+    setContainerHeight(Math.max(...columnHeights));
+  }, [columnWidth, columnCount, displayedImages]);
+
+  useEffect(() => {
+    calculateLayout();
+  }, [calculateLayout]);
+
+  const handleImageLoad = useCallback((imageId: string, aspectRatio: number) => {
+    if (loadedAspectRatios.current.get(imageId) !== aspectRatio) {
+      loadedAspectRatios.current.set(imageId, aspectRatio);
+      calculateLayout();
+    }
+  }, [calculateLayout]);
 
   if (images.length === 0) {
     return (
@@ -45,14 +133,18 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
 
   return (
     <div className="pb-4">
-      <div className="masonry-grid">
-        {displayedImages.map((image, index) => (
-          <div key={image.id} className="masonry-item">
-            <MasonryItem
-              image={image}
-              onClick={() => onImageClick(image, images, index)}
-            />
-          </div>
+      <div 
+        ref={containerRef}
+        className="relative w-full"
+        style={{ height: containerHeight || 'auto' }}
+      >
+        {layout.map((item) => (
+          <MasonryItem
+            key={item.image.id}
+            item={item}
+            onClick={() => onImageClick(item.image, images, item.index)}
+            onLoad={handleImageLoad}
+          />
         ))}
       </div>
 
@@ -72,14 +164,14 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
 }
 
 interface MasonryItemProps {
-  image: FeedImage;
+  item: LayoutItem;
   onClick: () => void;
+  onLoad: (imageId: string, aspectRatio: number) => void;
 }
 
-function MasonryItem({ image, onClick }: MasonryItemProps) {
+function MasonryItem({ item, onClick, onLoad }: MasonryItemProps) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(false);
-  const [aspectRatio, setAspectRatio] = useState<number | null>(null);
 
   const { ref, inView } = useInView({
     threshold: 0,
@@ -89,28 +181,30 @@ function MasonryItem({ image, onClick }: MasonryItemProps) {
 
   const handleLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
-    setAspectRatio(img.naturalWidth / img.naturalHeight);
+    const aspectRatio = img.naturalWidth / img.naturalHeight;
+    onLoad(item.image.id, aspectRatio);
     setLoaded(true);
   };
 
-  if (error) {
-    return null;
-  }
+  if (error) return null;
 
   return (
     <div
       ref={ref}
       onClick={onClick}
-      className="relative overflow-hidden cursor-pointer bg-[var(--color-bg-tertiary)] group"
-      style={{ 
-        aspectRatio: aspectRatio ? `${aspectRatio}` : '4/3',
-        minHeight: '80px'
+      className="absolute overflow-hidden cursor-pointer bg-[var(--color-bg-tertiary)] group"
+      style={{
+        left: item.x,
+        top: item.y,
+        width: item.width,
+        height: item.height,
+        transform: 'translateZ(0)'
       }}
     >
       {inView && (
         <img
-          src={image.thumbnailUrl || image.url}
-          alt={image.title || 'Image'}
+          src={item.image.thumbnailUrl || item.image.url}
+          alt={item.image.title || 'Image'}
           onLoad={handleLoad}
           onError={() => setError(true)}
           loading="lazy"

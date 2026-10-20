@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Modal } from './Modal';
 import { useStore } from '../store';
-import { STARTER_FEEDS, STARTER_CATEGORIES } from '../lib/starter-feeds';
+import { STARTER_FEEDS, FEED_CATEGORIES } from '../lib/starter-feeds';
 
 interface DiscoverModalProps {
   isOpen: boolean;
@@ -59,8 +59,8 @@ export function DiscoverModal({ isOpen, onClose }: DiscoverModalProps) {
         {/* Info notice */}
         <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg text-sm">
           <p className="text-[var(--color-text-secondary)]">
-            These feeds have CORS headers enabled and work directly in the browser. 
-            For other feeds, you may need to deploy your own CORS proxy (see Settings).
+            Visual inspiration feeds for design, architecture, art, and photography.
+            {!import.meta.env.VITE_CORS_PROXY_URL && ' Deploy the CORS proxy for best compatibility (see Settings).'}
           </p>
         </div>
 
@@ -76,7 +76,7 @@ export function DiscoverModal({ isOpen, onClose }: DiscoverModalProps) {
           >
             All
           </button>
-          {STARTER_CATEGORIES.map((category) => (
+          {FEED_CATEGORIES.map((category: string) => (
             <button
               key={category}
               onClick={() => setSelectedCategory(category)}
