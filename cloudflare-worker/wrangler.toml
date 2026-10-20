@@ -1,0 +1,10 @@
+name = "picstroom-proxy"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Optional: Add rate limiting
+# [vars]
+# MAX_REQUESTS_PER_MINUTE = "60"
+
+# The worker will be available at:
+# https://picstroom-proxy.<your-subdomain>.workers.dev/?url=<encoded-url>

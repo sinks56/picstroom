@@ -1,0 +1,306 @@
+import { useState, useRef } from 'react';
+import { Modal } from './Modal';
+import { useStore } from '../store';
+import { exportToOPML, parseOPML } from '../lib/storage';
+import { DEFAULT_PROXIES } from '../lib/cors-proxy';
+
+interface SettingsModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
+  const { settings, updateSettings, feeds, folders, addFeed, addFolder, removeFeed } = useStore();
+  const [activeTab, setActiveTab] = useState<'appearance' | 'feeds' | 'proxy' | 'data'>('appearance');
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleThemeChange = (theme: 'light' | 'dark' | 'system') => {
+    updateSettings({ theme });
+  };
+
+  const handleExportOPML = () => {
+    const opml = exportToOPML(feeds, folders);
+    const blob = new Blob([opml], { type: 'text/xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'picstroom-feeds.opml';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportOPML = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setImporting(true);
+    try {
+      const text = await file.text();
+      const { feeds: importedFeeds, folders: importedFolders } = parseOPML(text);
+
+      // Add folders
+      for (const folder of importedFolders) {
+        await addFolder(folder.name);
+      }
+
+      // Add feeds
+      for (const feed of importedFeeds) {
+        await addFeed(feed.url, feed.title);
+      }
+
+      alert(`Imported ${importedFeeds.length} feeds and ${importedFolders.length} folders`);
+    } catch (error) {
+      alert('Failed to import OPML file');
+    } finally {
+      setImporting(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
+  const handleDeleteAllFeeds = async () => {
+    if (confirm('Are you sure you want to delete all feeds? This cannot be undone.')) {
+      for (const feed of feeds) {
+        await removeFeed(feed.id);
+      }
+    }
+  };
+
+  const handleProxyToggle = (index: number) => {
+    const newProxyList = [...settings.proxyList];
+    newProxyList[index] = { ...newProxyList[index], enabled: !newProxyList[index].enabled };
+    updateSettings({ proxyList: newProxyList });
+  };
+
+  const handleCustomProxyChange = (value: string) => {
+    updateSettings({ customProxyUrl: value || undefined });
+  };
+
+  const handleResetProxies = () => {
+    updateSettings({ proxyList: DEFAULT_PROXIES, customProxyUrl: undefined });
+  };
+
+  const tabs = [
+    { id: 'appearance', label: 'Appearance' },
+    { id: 'feeds', label: 'Feeds' },
+    { id: 'proxy', label: 'Proxy' },
+    { id: 'data', label: 'Data' }
+  ] as const;
+
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} title="Settings" size="large">
+      <div className="flex border-b border-[var(--color-border)]">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`flex-1 px-4 py-3 text-sm font-medium transition-colors ${
+              activeTab === tab.id
+                ? 'text-[var(--color-accent)] border-b-2 border-[var(--color-accent)]'
+                : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="p-6">
+        {activeTab === 'appearance' && (
+          <div className="space-y-6">
+            <div>
+              <h3 className="text-sm font-medium mb-3">Theme</h3>
+              <div className="grid grid-cols-3 gap-3">
+                {(['light', 'dark', 'system'] as const).map((theme) => (
+                  <button
+                    key={theme}
+                    onClick={() => handleThemeChange(theme)}
+                    className={`p-4 rounded-xl border-2 transition-all ${
+                      settings.theme === theme
+                        ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10'
+                        : 'border-[var(--color-border)] hover:border-[var(--color-accent)]/50'
+                    }`}
+                  >
+                    <div className="flex flex-col items-center gap-2">
+                      {theme === 'light' && (
+                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" />
+                        </svg>
+                      )}
+                      {theme === 'dark' && (
+                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" />
+                        </svg>
+                      )}
+                      {theme === 'system' && (
+                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 12V5.25" />
+                        </svg>
+                      )}
+                      <span className="text-sm capitalize">{theme}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-medium mb-3">Image Quality</h3>
+              <div className="grid grid-cols-3 gap-3">
+                {(['low', 'medium', 'high'] as const).map((quality) => (
+                  <button
+                    key={quality}
+                    onClick={() => updateSettings({ imageQuality: quality })}
+                    className={`p-3 rounded-xl border-2 transition-all ${
+                      settings.imageQuality === quality
+                        ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10'
+                        : 'border-[var(--color-border)] hover:border-[var(--color-accent)]/50'
+                    }`}
+                  >
+                    <span className="text-sm capitalize">{quality}</span>
+                  </button>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-[var(--color-text-muted)]">
+                Higher quality uses more data but looks better on retina displays.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'feeds' && (
+          <div className="space-y-4">
+            {feeds.length === 0 ? (
+              <p className="text-[var(--color-text-muted)] text-center py-8">
+                No feeds added yet
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {feeds.map((feed) => (
+                  <div
+                    key={feed.id}
+                    className="flex items-center justify-between p-4 rounded-xl bg-[var(--color-bg-secondary)]"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <h4 className="font-medium truncate">{feed.title}</h4>
+                      <p className="text-sm text-[var(--color-text-muted)] truncate">{feed.url}</p>
+                    </div>
+                    <button
+                      onClick={() => removeFeed(feed.id)}
+                      className="ml-4 p-2 rounded-lg hover:bg-red-500/10 text-red-500 transition-colors"
+                      aria-label="Delete feed"
+                    >
+                      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+                      </svg>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'proxy' && (
+          <div className="space-y-6">
+            <p className="text-sm text-[var(--color-text-muted)]">
+              Most RSS feeds can't be fetched directly due to CORS restrictions. 
+              Enable CORS proxies to fetch feeds through intermediary servers.
+            </p>
+
+            <div>
+              <h3 className="text-sm font-medium mb-3">Public Proxies</h3>
+              <div className="space-y-2">
+                {settings.proxyList.map((proxy, index) => (
+                  <label
+                    key={proxy.name}
+                    className="flex items-center justify-between p-4 rounded-xl bg-[var(--color-bg-secondary)] cursor-pointer"
+                  >
+                    <span className="font-medium">{proxy.name}</span>
+                    <input
+                      type="checkbox"
+                      checked={proxy.enabled}
+                      onChange={() => handleProxyToggle(index)}
+                      className="w-5 h-5 rounded border-[var(--color-border)] text-[var(--color-accent)] focus:ring-[var(--color-accent)]"
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-medium mb-3">Custom Proxy URL</h3>
+              <input
+                type="url"
+                value={settings.customProxyUrl || ''}
+                onChange={(e) => handleCustomProxyChange(e.target.value)}
+                placeholder="https://your-proxy.example.com/?url={url}"
+                className="w-full px-4 py-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent"
+              />
+              <p className="mt-2 text-xs text-[var(--color-text-muted)]">
+                Use {'{url}'} as placeholder for the target URL. Custom proxy is tried before public proxies.
+              </p>
+            </div>
+
+            <button
+              onClick={handleResetProxies}
+              className="text-sm text-[var(--color-accent)] hover:underline"
+            >
+              Reset to defaults
+            </button>
+          </div>
+        )}
+
+        {activeTab === 'data' && (
+          <div className="space-y-6">
+            <div>
+              <h3 className="text-sm font-medium mb-3">Import / Export</h3>
+              <div className="flex gap-3">
+                <button
+                  onClick={handleExportOPML}
+                  disabled={feeds.length === 0}
+                  className="flex-1 px-4 py-3 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] transition-colors font-medium disabled:opacity-50"
+                >
+                  Export OPML
+                </button>
+                <label className="flex-1">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".opml,.xml"
+                    onChange={handleImportOPML}
+                    className="hidden"
+                  />
+                  <span className="block px-4 py-3 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] transition-colors font-medium text-center cursor-pointer">
+                    {importing ? 'Importing...' : 'Import OPML'}
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-medium mb-3">Danger Zone</h3>
+              <button
+                onClick={handleDeleteAllFeeds}
+                disabled={feeds.length === 0}
+                className="w-full px-4 py-3 rounded-xl border border-red-500/30 text-red-500 hover:bg-red-500/10 transition-colors font-medium disabled:opacity-50"
+              >
+                Delete All Feeds
+              </button>
+            </div>
+
+            <div className="pt-4 border-t border-[var(--color-border)]">
+              <p className="text-xs text-[var(--color-text-muted)] text-center">
+                PicStroom v1.0 • All data stored locally on your device
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
