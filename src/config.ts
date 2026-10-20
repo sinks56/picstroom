@@ -6,7 +6,7 @@
  * to direct fetch (for CORS-enabled feeds) and public proxies as last resort.
  */
 
-export const CORS_PROXY_URL = import.meta.env.VITE_CORS_PROXY_URL || '';
+export const CORS_PROXY_URL = import.meta.env.VITE_CORS_PROXY_URL || 'https://picstroom-proxy.pages.dev';
 
 export const ALLOWED_ORIGINS = [
   'https://sinks56.github.io',
