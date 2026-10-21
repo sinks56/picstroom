@@ -22,7 +22,8 @@ export default function App() {
   const { 
     initialized, initialize, settings, feeds, 
     filteredImagesByFeed, filteredAllImages, 
-    error, clearError 
+    error, clearError,
+    imagesByFeed: rawImagesByFeed, allImages: rawAllImages, timeWindowMultiplier
   } = useStore();
   
   const [addFeedOpen, setAddFeedOpen] = useState(false);
@@ -33,8 +34,10 @@ export default function App() {
   const [viewState, setViewState] = useState<ViewState>({ type: 'main' });
 
   // Memoize filtered results to avoid recalculation on every render
-  const imagesByFeed = useMemo(() => filteredImagesByFeed(), [filteredImagesByFeed]);
-  const allImages = useMemo(() => filteredAllImages(), [filteredAllImages]);
+  // Depend on the raw data too: the getter functions are stable references, so
+  // depending on them alone froze the lists at their first (empty) value.
+  const imagesByFeed = useMemo(() => filteredImagesByFeed(), [filteredImagesByFeed, rawImagesByFeed, timeWindowMultiplier]);
+  const allImages = useMemo(() => filteredAllImages(), [filteredAllImages, rawAllImages, timeWindowMultiplier]);
 
   useEffect(() => {
     initialize();
