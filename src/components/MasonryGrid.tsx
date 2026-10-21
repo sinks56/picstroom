@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useInView } from 'react-intersection-observer';
 import type { FeedImage } from '../types';
+import { useStore } from '../store';
 
 interface MasonryGridProps {
   images: FeedImage[];
@@ -8,6 +9,7 @@ interface MasonryGridProps {
 }
 
 const BATCH_SIZE = 40;
+const VIRTUALIZATION_BUFFER = 500; // pixels above/below viewport to render
 
 interface LayoutItem {
   image: FeedImage;
@@ -19,27 +21,68 @@ interface LayoutItem {
 }
 
 export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
+  const { loadOlderPosts, loadingOlder, reachedEnd } = useStore();
   const [displayCount, setDisplayCount] = useState(BATCH_SIZE);
   const [containerWidth, setContainerWidth] = useState(0);
   const [layout, setLayout] = useState<LayoutItem[]>([]);
   const [containerHeight, setContainerHeight] = useState(0);
+  const [scrollY, setScrollY] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
   const loadedAspectRatios = useRef<Map<string, number>>(new Map());
+  const prevImagesLength = useRef(images.length);
 
-  const { ref: bottomRef, inView } = useInView({
+  const { ref: bottomRef, inView: bottomInView } = useInView({
     threshold: 0,
     rootMargin: '400px'
   });
 
+  const { ref: olderRef, inView: olderInView } = useInView({
+    threshold: 0,
+    rootMargin: '200px'
+  });
+
+  // Load more images when scrolling down
   useEffect(() => {
-    if (inView && displayCount < images.length) {
+    if (bottomInView && displayCount < images.length) {
       setDisplayCount(prev => Math.min(prev + BATCH_SIZE, images.length));
     }
-  }, [inView, displayCount, images.length]);
+  }, [bottomInView, displayCount, images.length]);
 
+  // Load older posts when reaching the end of current window
   useEffect(() => {
-    setDisplayCount(BATCH_SIZE);
-  }, [images]);
+    if (olderInView && displayCount >= images.length && !loadingOlder && !reachedEnd) {
+      loadOlderPosts();
+    }
+  }, [olderInView, displayCount, images.length, loadingOlder, reachedEnd, loadOlderPosts]);
+
+  // Only reset displayCount when images actually shrink (feed removed), not when expanded
+  useEffect(() => {
+    if (images.length < prevImagesLength.current) {
+      setDisplayCount(Math.min(displayCount, Math.max(BATCH_SIZE, images.length)));
+    } else if (images.length > prevImagesLength.current && displayCount < BATCH_SIZE) {
+      setDisplayCount(BATCH_SIZE);
+    }
+    prevImagesLength.current = images.length;
+  }, [images.length, displayCount]);
+
+  // Track scroll position for virtualization
+  useEffect(() => {
+    const handleScroll = () => {
+      setScrollY(window.scrollY);
+    };
+    
+    setViewportHeight(window.innerHeight);
+    handleScroll();
+    
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('resize', () => setViewportHeight(window.innerHeight));
+    
+    return () => {
+      window.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('resize', () => setViewportHeight(window.innerHeight));
+    };
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -117,6 +160,21 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
     }
   }, [calculateLayout]);
 
+  // Filter items to only render those in/near viewport (virtualization)
+  const visibleItems = useMemo(() => {
+    if (!containerRef.current) return layout;
+    
+    const containerTop = containerRef.current.offsetTop;
+    const viewTop = scrollY - VIRTUALIZATION_BUFFER;
+    const viewBottom = scrollY + viewportHeight + VIRTUALIZATION_BUFFER;
+    
+    return layout.filter(item => {
+      const itemTop = containerTop + item.y;
+      const itemBottom = itemTop + item.height;
+      return itemBottom >= viewTop && itemTop <= viewBottom;
+    });
+  }, [layout, scrollY, viewportHeight]);
+
   if (images.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-20 px-4 text-center">
@@ -138,7 +196,7 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
         className="relative w-full"
         style={{ height: containerHeight || 'auto' }}
       >
-        {layout.map((item) => (
+        {visibleItems.map((item) => (
           <MasonryItem
             key={item.image.id}
             item={item}
@@ -148,6 +206,7 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
         ))}
       </div>
 
+      {/* Loading more from current batch */}
       {displayCount < images.length && (
         <div ref={bottomRef} className="flex justify-center py-4">
           <div className="flex items-center gap-2 text-[var(--color-text-muted)] text-sm">
@@ -157,6 +216,25 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
             </svg>
             <span>Loading...</span>
           </div>
+        </div>
+      )}
+
+      {/* Loading older posts / end state */}
+      {displayCount >= images.length && (
+        <div ref={olderRef} className="flex justify-center py-6">
+          {loadingOlder ? (
+            <div className="flex items-center gap-2 text-[var(--color-text-muted)] text-sm">
+              <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+              <span>Loading older posts...</span>
+            </div>
+          ) : reachedEnd ? (
+            <div className="text-[var(--color-text-muted)] text-xs">
+              No more posts
+            </div>
+          ) : null}
         </div>
       )}
     </div>
@@ -173,12 +251,6 @@ function MasonryItem({ item, onClick, onLoad }: MasonryItemProps) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(false);
 
-  const { ref, inView } = useInView({
-    threshold: 0,
-    triggerOnce: true,
-    rootMargin: '200px'
-  });
-
   const handleLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
     const aspectRatio = img.naturalWidth / img.naturalHeight;
@@ -190,28 +262,26 @@ function MasonryItem({ item, onClick, onLoad }: MasonryItemProps) {
 
   return (
     <div
-      ref={ref}
       onClick={onClick}
-      className="absolute overflow-hidden cursor-pointer bg-[var(--color-bg-tertiary)] group"
+      className="absolute overflow-hidden cursor-pointer bg-[var(--color-bg-tertiary)]"
       style={{
         left: item.x,
         top: item.y,
         width: item.width,
         height: item.height,
-        transform: 'translateZ(0)'
+        transform: 'translateZ(0)',
+        willChange: 'transform'
       }}
     >
-      {inView && (
-        <img
-          src={item.image.thumbnailUrl || item.image.url}
-          alt={item.image.title || 'Image'}
-          onLoad={handleLoad}
-          onError={() => setError(true)}
-          loading="lazy"
-          decoding="async"
-          className={`w-full h-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`}
-        />
-      )}
+      <img
+        src={item.image.thumbnailUrl || item.image.url}
+        alt={item.image.title || 'Image'}
+        onLoad={handleLoad}
+        onError={() => setError(true)}
+        loading="lazy"
+        decoding="async"
+        className={`w-full h-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`}
+      />
 
       {!loaded && !error && (
         <div className="absolute inset-0 animate-pulse bg-[var(--color-bg-tertiary)]" />

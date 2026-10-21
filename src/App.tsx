@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { useStore } from './store';
 import type { Feed, FeedImage } from './types';
@@ -12,13 +12,18 @@ import { FavoritesModal } from './components/FavoritesModal';
 import { DiscoverModal } from './components/DiscoverModal';
 import { FeedManageModal } from './components/FeedManageModal';
 import { EmptyState } from './components/EmptyState';
+import { App as CapacitorApp } from '@capacitor/app';
 
 type ViewState = 
   | { type: 'main' }
   | { type: 'viewer'; images: FeedImage[]; index: number; fromFeedId?: string };
 
 export default function App() {
-  const { initialized, initialize, settings, feeds, filteredImagesByFeed, filteredAllImages, error, clearError } = useStore();
+  const { 
+    initialized, initialize, settings, feeds, 
+    filteredImagesByFeed, filteredAllImages, 
+    error, clearError 
+  } = useStore();
   
   const [addFeedOpen, setAddFeedOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -27,8 +32,9 @@ export default function App() {
   const [manageFeed, setManageFeed] = useState<Feed | null>(null);
   const [viewState, setViewState] = useState<ViewState>({ type: 'main' });
 
-  const imagesByFeed = filteredImagesByFeed();
-  const allImages = filteredAllImages();
+  // Memoize filtered results to avoid recalculation on every render
+  const imagesByFeed = useMemo(() => filteredImagesByFeed(), [filteredImagesByFeed]);
+  const allImages = useMemo(() => filteredAllImages(), [filteredAllImages]);
 
   useEffect(() => {
     initialize();
@@ -61,6 +67,38 @@ export default function App() {
 
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
+
+  // Handle Capacitor (Android) back button
+  useEffect(() => {
+    const backHandler = CapacitorApp.addListener('backButton', ({ canGoBack }) => {
+      // If viewer is open, close it
+      if (viewState.type === 'viewer') {
+        setViewState({ type: 'main' });
+        if (history.state?.type === 'viewer') {
+          history.back();
+        }
+        return;
+      }
+      
+      // If any modal is open, close it
+      if (addFeedOpen) { setAddFeedOpen(false); return; }
+      if (settingsOpen) { setSettingsOpen(false); return; }
+      if (favoritesOpen) { setFavoritesOpen(false); return; }
+      if (discoverOpen) { setDiscoverOpen(false); return; }
+      if (manageFeed) { setManageFeed(null); return; }
+      
+      // At root - use default behavior (minimize/exit)
+      if (canGoBack) {
+        history.back();
+      } else {
+        CapacitorApp.minimizeApp();
+      }
+    });
+
+    return () => {
+      backHandler.then(h => h.remove());
+    };
+  }, [viewState, addFeedOpen, settingsOpen, favoritesOpen, discoverOpen, manageFeed]);
 
   const handleImageClick = useCallback((_image: FeedImage, images: FeedImage[], index: number, feedId?: string) => {
     const newState: ViewState = { type: 'viewer', images, index, fromFeedId: feedId };

@@ -1,7 +1,6 @@
-import { useRef } from 'react';
+import { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import type { Feed, FeedImage } from '../types';
 import { useStore } from '../store';
-import { ImageCard } from './ImageCard';
 
 interface FeedRowProps {
   feed: Feed;
@@ -10,15 +9,75 @@ interface FeedRowProps {
   onManageFeed: () => void;
 }
 
+const ROW_HEIGHT = 140;
+const VIRTUALIZATION_BUFFER = 400; // pixels left/right of viewport to render
+
 export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const { refreshFeed, loadingFeeds } = useStore();
   const isLoading = loadingFeeds.has(feed.id);
+  const [scrollLeft, setScrollLeft] = useState(0);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const [imageWidths, setImageWidths] = useState<Map<string, number>>(new Map());
 
   const handleRefresh = (e: React.MouseEvent) => {
     e.stopPropagation();
     refreshFeed(feed.id);
   };
+
+  // Track scroll position
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+
+    const handleScroll = () => {
+      setScrollLeft(container.scrollLeft);
+    };
+
+    setContainerWidth(container.offsetWidth);
+    container.addEventListener('scroll', handleScroll, { passive: true });
+
+    const resizeObserver = new ResizeObserver(() => {
+      setContainerWidth(container.offsetWidth);
+    });
+    resizeObserver.observe(container);
+
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  const handleImageLoad = useCallback((imageId: string, width: number) => {
+    setImageWidths(prev => {
+      if (prev.get(imageId) === width) return prev;
+      const next = new Map(prev);
+      next.set(imageId, width);
+      return next;
+    });
+  }, []);
+
+  // Calculate positions and which items are visible
+  const { visibleItems, totalWidth } = useMemo(() => {
+    let x = 0;
+    const items: { image: FeedImage; index: number; x: number; width: number }[] = [];
+    
+    images.forEach((image, index) => {
+      const width = imageWidths.get(image.id) || ROW_HEIGHT;
+      items.push({ image, index, x, width });
+      x += width;
+    });
+
+    const viewStart = scrollLeft - VIRTUALIZATION_BUFFER;
+    const viewEnd = scrollLeft + containerWidth + VIRTUALIZATION_BUFFER;
+
+    const visible = items.filter(item => {
+      const itemEnd = item.x + item.width;
+      return itemEnd >= viewStart && item.x <= viewEnd;
+    });
+
+    return { visibleItems: visible, totalWidth: x };
+  }, [images, imageWidths, scrollLeft, containerWidth]);
 
   if (images.length === 0 && !isLoading) {
     return (
@@ -79,26 +138,86 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
         </button>
       </div>
 
-      {/* Image Row - NO gaps, edge to edge */}
-      <div ref={scrollRef} className="image-row">
+      {/* Virtualized Image Row */}
+      <div 
+        ref={scrollRef} 
+        className="image-row relative"
+        style={{ height: `${ROW_HEIGHT}px` }}
+      >
         {isLoading && images.length === 0 ? (
           Array.from({ length: 8 }).map((_, i) => (
             <div
               key={i}
-              className="h-[140px] w-[140px] bg-[var(--color-bg-tertiary)] animate-pulse flex-shrink-0"
+              className="h-full w-[140px] bg-[var(--color-bg-tertiary)] animate-pulse flex-shrink-0"
             />
           ))
         ) : (
-          images.map((image, index) => (
-            <ImageCard
-              key={image.id}
-              image={image}
-              onClick={() => onImageClick(image, images, index, feed.id)}
-              size="medium"
-            />
-          ))
+          <div style={{ width: totalWidth, height: ROW_HEIGHT, position: 'relative' }}>
+            {visibleItems.map((item) => (
+              <VirtualizedImageCard
+                key={item.image.id}
+                image={item.image}
+                x={item.x}
+                onClick={() => onImageClick(item.image, images, item.index, feed.id)}
+                onWidthKnown={handleImageLoad}
+              />
+            ))}
+          </div>
         )}
       </div>
+    </div>
+  );
+}
+
+interface VirtualizedImageCardProps {
+  image: FeedImage;
+  x: number;
+  onClick: () => void;
+  onWidthKnown: (imageId: string, width: number) => void;
+}
+
+function VirtualizedImageCard({ image, x, onClick, onWidthKnown }: VirtualizedImageCardProps) {
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState(false);
+  const [width, setWidth] = useState(ROW_HEIGHT);
+
+  const handleLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    const { naturalWidth, naturalHeight } = img;
+    if (naturalWidth && naturalHeight) {
+      const calculatedWidth = Math.round(ROW_HEIGHT * (naturalWidth / naturalHeight));
+      setWidth(calculatedWidth);
+      onWidthKnown(image.id, calculatedWidth);
+    }
+    setLoaded(true);
+  };
+
+  if (error) return null;
+
+  return (
+    <div
+      onClick={onClick}
+      className="absolute top-0 overflow-hidden cursor-pointer bg-[var(--color-bg-tertiary)]"
+      style={{
+        left: x,
+        width: width,
+        height: ROW_HEIGHT,
+        transform: 'translateZ(0)'
+      }}
+    >
+      <img
+        src={image.thumbnailUrl || image.url}
+        alt={image.title || 'Image'}
+        onLoad={handleLoad}
+        onError={() => setError(true)}
+        loading="lazy"
+        decoding="async"
+        className={`w-full h-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`}
+      />
+
+      {!loaded && !error && (
+        <div className="absolute inset-0 animate-pulse bg-[var(--color-bg-tertiary)]" />
+      )}
     </div>
   );
 }

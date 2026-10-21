@@ -24,9 +24,12 @@ import { fetchWithCorsProxy } from '../lib/cors-proxy';
 import { parseFeed, discoverFeedUrl, isFeedUrl } from '../lib/feed-parser';
 import { imageCache } from '../lib/image-cache';
 
-function filterImagesByTimeWindow(images: FeedImage[], timeWindowDays: number): FeedImage[] {
-  if (timeWindowDays <= 0) return images;
-  const cutoff = Date.now() - (timeWindowDays * 24 * 60 * 60 * 1000);
+const TIME_WINDOW_CHUNK_DAYS = 14;
+
+function filterImagesByTimeWindow(images: FeedImage[], windowMultiplier: number): FeedImage[] {
+  const windowDays = TIME_WINDOW_CHUNK_DAYS * windowMultiplier;
+  if (windowDays <= 0) return images;
+  const cutoff = Date.now() - (windowDays * 24 * 60 * 60 * 1000);
   return images.filter(img => {
     const date = img.pubDate || img.fetchedAt;
     return date >= cutoff;
@@ -43,14 +46,25 @@ interface AppState {
   allImages: FeedImage[];
   loadingFeeds: Set<string>;
   error: string | null;
+  
+  // Time window state
+  timeWindowMultiplier: number;
+  loadingOlder: boolean;
+  reachedEnd: boolean;
 
-  // Computed
+  // Cached filtered results (memoized)
+  _cachedFilteredByFeed: Record<string, FeedImage[]> | null;
+  _cachedFilteredAll: FeedImage[] | null;
+  _cacheKey: string;
+
+  // Computed (with memoization)
   filteredImagesByFeed: () => Record<string, FeedImage[]>;
   filteredAllImages: () => FeedImage[];
 
   // Actions
   initialize: () => Promise<void>;
   updateSettings: (settings: Partial<Settings>) => Promise<void>;
+  loadOlderPosts: () => Promise<void>;
   
   addFeed: (urlOrFeedUrl: string, customTitle?: string) => Promise<Feed | null>;
   updateFeed: (feedId: string, updates: Partial<Feed>) => Promise<void>;
@@ -80,19 +94,67 @@ export const useStore = create<AppState>((set, get) => ({
   allImages: [],
   loadingFeeds: new Set(),
   error: null,
+  timeWindowMultiplier: 1,
+  loadingOlder: false,
+  reachedEnd: false,
+  _cachedFilteredByFeed: null,
+  _cachedFilteredAll: null,
+  _cacheKey: '',
 
   filteredImagesByFeed: () => {
-    const { imagesByFeed, settings } = get();
+    const { imagesByFeed, timeWindowMultiplier, _cachedFilteredByFeed, _cacheKey } = get();
+    const newKey = `byFeed-${timeWindowMultiplier}-${Object.keys(imagesByFeed).join(',')}-${Object.values(imagesByFeed).reduce((a, b) => a + b.length, 0)}`;
+    
+    if (_cacheKey === newKey && _cachedFilteredByFeed) {
+      return _cachedFilteredByFeed;
+    }
+    
     const result: Record<string, FeedImage[]> = {};
     for (const [feedId, images] of Object.entries(imagesByFeed)) {
-      result[feedId] = filterImagesByTimeWindow(images, settings.timeWindowDays);
+      result[feedId] = filterImagesByTimeWindow(images, timeWindowMultiplier);
     }
+    
+    set({ _cachedFilteredByFeed: result, _cacheKey: newKey });
     return result;
   },
 
   filteredAllImages: () => {
-    const { allImages, settings } = get();
-    return filterImagesByTimeWindow(allImages, settings.timeWindowDays);
+    const { allImages, timeWindowMultiplier, _cachedFilteredAll, _cacheKey } = get();
+    const newKey = `all-${timeWindowMultiplier}-${allImages.length}`;
+    
+    if (_cacheKey === newKey && _cachedFilteredAll) {
+      return _cachedFilteredAll;
+    }
+    
+    const result = filterImagesByTimeWindow(allImages, timeWindowMultiplier);
+    set({ _cachedFilteredAll: result, _cacheKey: newKey });
+    return result;
+  },
+
+  loadOlderPosts: async () => {
+    const { loadingOlder, reachedEnd, allImages, timeWindowMultiplier } = get();
+    if (loadingOlder || reachedEnd) return;
+
+    set({ loadingOlder: true });
+
+    const newMultiplier = timeWindowMultiplier + 1;
+    const currentFiltered = filterImagesByTimeWindow(allImages, timeWindowMultiplier);
+    const newFiltered = filterImagesByTimeWindow(allImages, newMultiplier);
+
+    // If no new images are revealed, we've reached the end of persisted history
+    if (newFiltered.length === currentFiltered.length) {
+      set({ loadingOlder: false, reachedEnd: true });
+      return;
+    }
+
+    // Invalidate cache and update multiplier
+    set({ 
+      timeWindowMultiplier: newMultiplier, 
+      loadingOlder: false,
+      _cachedFilteredByFeed: null,
+      _cachedFilteredAll: null,
+      _cacheKey: ''
+    });
   },
 
   initialize: async () => {
