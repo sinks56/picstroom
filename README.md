@@ -94,11 +94,23 @@ The built `dist` folder can be deployed to any static hosting service:
 
 ## CORS Proxy
 
-Most RSS feeds don't include CORS headers, so the app uses CORS proxies to fetch them. The app includes several public proxies and tries them in order.
+Most RSS feeds don't include CORS headers, so the app uses a CORS proxy to fetch them. The app ships with a default proxy at `https://picstroom-proxy.pages.dev`.
 
-### Using the Custom Proxy
+### Deploying Your Own Proxy (Cloudflare Pages)
 
-For better reliability, deploy your own Cloudflare Worker proxy:
+To deploy your own relay using Cloudflare Pages:
+
+```bash
+cd cloudflare-worker
+mkdir dist && cp worker.js dist/_worker.js
+npx wrangler pages deploy dist --project-name picstroom-proxy
+```
+
+Then set `VITE_CORS_PROXY_URL` in your build environment or update `src/config.ts`.
+
+### Alternative: Cloudflare Workers
+
+You can also deploy as a traditional Worker:
 
 1. Go to the `cloudflare-worker` folder
 2. Follow the instructions in `cloudflare-worker/README.md`
