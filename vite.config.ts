@@ -4,7 +4,8 @@ import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
 export default defineConfig({
-  base: '/picstroom/',
+  // Android (Capacitor) serves dist/ from the WebView root, so it needs base '/'.
+  base: process.env.CAP_BUILD ? '/' : '/picstroom/',
   plugins: [
     react(),
     tailwindcss(),
@@ -15,8 +16,8 @@ export default defineConfig({
         name: 'PicStroom',
         short_name: 'PicStroom',
         description: 'Visual inspiration browser - images from RSS feeds',
-        theme_color: '#0f172a',
-        background_color: '#0f172a',
+        theme_color: '#000000',
+        background_color: '#000000',
         display: 'standalone',
         orientation: 'any',
         start_url: '/picstroom/',
