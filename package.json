@@ -11,6 +11,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@capacitor/android": "^8.5.3",
+    "@capacitor/cli": "^8.5.3",
+    "@capacitor/core": "^8.5.3",
     "@use-gesture/react": "^10.3.1",
     "framer-motion": "^14.4.0",
     "idb": "^8.0.4",

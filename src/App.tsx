@@ -13,18 +13,22 @@ import { DiscoverModal } from './components/DiscoverModal';
 import { FeedManageModal } from './components/FeedManageModal';
 import { EmptyState } from './components/EmptyState';
 
+type ViewState = 
+  | { type: 'main' }
+  | { type: 'viewer'; images: FeedImage[]; index: number; fromFeedId?: string };
+
 export default function App() {
-  const { initialized, initialize, settings, feeds, imagesByFeed, allImages, error, clearError } = useStore();
+  const { initialized, initialize, settings, feeds, filteredImagesByFeed, filteredAllImages, error, clearError } = useStore();
   
   const [addFeedOpen, setAddFeedOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [favoritesOpen, setFavoritesOpen] = useState(false);
   const [discoverOpen, setDiscoverOpen] = useState(false);
   const [manageFeed, setManageFeed] = useState<Feed | null>(null);
-  const [viewerState, setViewerState] = useState<{
-    images: FeedImage[];
-    index: number;
-  } | null>(null);
+  const [viewState, setViewState] = useState<ViewState>({ type: 'main' });
+
+  const imagesByFeed = filteredImagesByFeed();
+  const allImages = filteredAllImages();
 
   useEffect(() => {
     initialize();
@@ -37,12 +41,39 @@ export default function App() {
     }
   }, [error, clearError]);
 
-  const handleImageClick = useCallback((_image: FeedImage, images: FeedImage[], index: number) => {
-    setViewerState({ images, index });
+  // Handle browser back button / gesture
+  useEffect(() => {
+    const handlePopState = (e: PopStateEvent) => {
+      const state = e.state;
+      if (state?.type === 'viewer') {
+        setViewState(state);
+      } else {
+        setViewState({ type: 'main' });
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    
+    // Push initial state if not present
+    if (!history.state) {
+      history.replaceState({ type: 'main' }, '');
+    }
+
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  const handleImageClick = useCallback((_image: FeedImage, images: FeedImage[], index: number, feedId?: string) => {
+    const newState: ViewState = { type: 'viewer', images, index, fromFeedId: feedId };
+    setViewState(newState);
+    history.pushState(newState, '');
   }, []);
 
   const handleCloseViewer = useCallback(() => {
-    setViewerState(null);
+    setViewState({ type: 'main' });
+    // Go back in history if we can, otherwise just update state
+    if (history.state?.type === 'viewer') {
+      history.back();
+    }
   }, []);
 
   if (!initialized) {
@@ -147,10 +178,10 @@ export default function App() {
 
       {/* Full-screen image viewer */}
       <AnimatePresence>
-        {viewerState && (
+        {viewState.type === 'viewer' && (
           <ImageViewer
-            images={viewerState.images}
-            initialIndex={viewerState.index}
+            images={viewState.images}
+            initialIndex={viewState.index}
             onClose={handleCloseViewer}
           />
         )}

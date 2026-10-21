@@ -22,6 +22,16 @@ import {
 } from '../lib/storage';
 import { fetchWithCorsProxy } from '../lib/cors-proxy';
 import { parseFeed, discoverFeedUrl, isFeedUrl } from '../lib/feed-parser';
+import { imageCache } from '../lib/image-cache';
+
+function filterImagesByTimeWindow(images: FeedImage[], timeWindowDays: number): FeedImage[] {
+  if (timeWindowDays <= 0) return images;
+  const cutoff = Date.now() - (timeWindowDays * 24 * 60 * 60 * 1000);
+  return images.filter(img => {
+    const date = img.pubDate || img.fetchedAt;
+    return date >= cutoff;
+  });
+}
 
 interface AppState {
   initialized: boolean;
@@ -33,6 +43,10 @@ interface AppState {
   allImages: FeedImage[];
   loadingFeeds: Set<string>;
   error: string | null;
+
+  // Computed
+  filteredImagesByFeed: () => Record<string, FeedImage[]>;
+  filteredAllImages: () => FeedImage[];
 
   // Actions
   initialize: () => Promise<void>;
@@ -67,9 +81,23 @@ export const useStore = create<AppState>((set, get) => ({
   loadingFeeds: new Set(),
   error: null,
 
+  filteredImagesByFeed: () => {
+    const { imagesByFeed, settings } = get();
+    const result: Record<string, FeedImage[]> = {};
+    for (const [feedId, images] of Object.entries(imagesByFeed)) {
+      result[feedId] = filterImagesByTimeWindow(images, settings.timeWindowDays);
+    }
+    return result;
+  },
+
+  filteredAllImages: () => {
+    const { allImages, settings } = get();
+    return filterImagesByTimeWindow(allImages, settings.timeWindowDays);
+  },
+
   initialize: async () => {
     try {
-      await initDB();
+      await Promise.all([initDB(), imageCache.init()]);
       const [settings, feeds, folders, favorites] = await Promise.all([
         getSettings(),
         getFeeds(),
@@ -187,6 +215,7 @@ export const useStore = create<AppState>((set, get) => ({
             url: imgUrl,
             sourceUrl: item.link || feedUrl,
             title: item.title,
+            pubDate: item.pubDate ? item.pubDate.getTime() : undefined,
             fetchedAt: Date.now()
           });
         }
@@ -269,6 +298,7 @@ export const useStore = create<AppState>((set, get) => ({
             url: imgUrl,
             sourceUrl: item.link || feed.url,
             title: item.title,
+            pubDate: item.pubDate ? item.pubDate.getTime() : undefined,
             fetchedAt: Date.now()
           });
         }

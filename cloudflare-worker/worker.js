@@ -8,10 +8,12 @@
  */
 
 const ALLOWED_ORIGINS = [
-  'https://sinks56.github.io'
+  'https://sinks56.github.io',
+  'capacitor://localhost',
+  'http://localhost'
 ];
 
-const ALLOWED_LOCALHOST_PATTERN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+const ALLOWED_LOCALHOST_PATTERN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
 const ALLOWED_FEED_CONTENT_TYPES = [
   'application/rss+xml',

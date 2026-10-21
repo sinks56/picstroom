@@ -5,7 +5,7 @@ import type { FeedImage } from '../types';
 interface FavoritesModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImageClick: (image: FeedImage, allImages: FeedImage[], index: number) => void;
+  onImageClick: (image: FeedImage, allImages: FeedImage[], index: number, feedId?: string) => void;
 }
 
 export function FavoritesModal({ isOpen, onClose, onImageClick }: FavoritesModalProps) {
