@@ -1,27 +1,16 @@
 import { openDB, type IDBPDatabase } from 'idb';
+import { canonicalImageKey } from './feed-parser';
 import type { Feed, FeedImage, Folder, FavoriteImage, Settings } from '../types';
 import { DEFAULT_PROXIES } from './cors-proxy';
 
 const DB_NAME = 'picstroom';
 const DB_VERSION = 2;
 
-function normalizeUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    let path = u.pathname.replace(/\/+$/, '');
-    const search = u.search;
-    return `${u.protocol}//${u.host}${path}${search}`.toLowerCase();
-  } catch {
-    return url.toLowerCase();
-  }
-}
-
 export function getDedupeKey(image: FeedImage): string {
-  if (image.guid) return `guid:${image.guid}`;
-  if (image.sourceUrl && image.url) {
-    return `link-img:${normalizeUrl(image.sourceUrl)}|${normalizeUrl(image.url)}`;
-  }
-  return `url:${normalizeUrl(image.url)}`;
+  // Key on the picture itself (size variants collapsed). Keying on guid/post was wrong:
+  // a post has many images, and images stored before guids existed would never match
+  // their re-fetched copies, so every refresh after upgrading would duplicate them.
+  return `img:${canonicalImageKey(image.url)}`;
 }
 
 export function dedupeImages(images: FeedImage[]): FeedImage[] {

@@ -21,29 +21,52 @@ function shouldSkipImage(url: string): boolean {
   return SKIP_PATTERNS.some(pattern => pattern.test(url));
 }
 
-function extractImagesFromHtml(html: string): string[] {
-  const images: string[] = [];
-  
-  // Match img tags
-  const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*>/gi;
-  let match;
-  while ((match = imgRegex.exec(html)) !== null) {
-    const src = match[1];
-    if (src && !shouldSkipImage(src)) {
-      images.push(src);
+// Key that treats WordPress-style size variants (photo-300x200.jpg, photo-1024x683.jpg,
+// photo.jpg) as the same picture.
+export function canonicalImageKey(url: string): string {
+  return url.replace(/[?#].*$/, '').replace(/-\d+x\d+(?=\.[a-z0-9]+$)/i, '').toLowerCase();
+}
+
+function dedupeByCanonical(urls: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const u of urls) {
+    const key = canonicalImageKey(u);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(u);
+  }
+  return out;
+}
+
+// Pick one URL per <img>: the largest srcset candidate up to 2048w, else src.
+// (Previously every srcset size was added, so each picture appeared 4-5 times.)
+function bestSourceForImgTag(tag: string): string | null {
+  const srcset = /\ssrcset=["']([^"']+)["']/i.exec(tag)?.[1];
+  if (srcset) {
+    const candidates = srcset.split(',').map(s => {
+      const [u, d] = s.trim().split(/\s+/);
+      const w = d && /^\d+w$/.test(d) ? parseInt(d) : 0;
+      return { u, w };
+    }).filter(c => c.u && !shouldSkipImage(c.u));
+    if (candidates.length) {
+      const capped = candidates.filter(c => c.w > 0 && c.w <= 2048);
+      const pool = capped.length ? capped : candidates;
+      pool.sort((a, b) => b.w - a.w);
+      return pool[0].u;
     }
   }
+  const src = /\ssrc=["']([^"']+)["']/i.exec(tag)?.[1];
+  return src && !shouldSkipImage(src) ? src : null;
+}
 
-  // Match srcset for higher quality images
-  const srcsetRegex = /<img[^>]+srcset=["']([^"']+)["'][^>]*>/gi;
-  while ((match = srcsetRegex.exec(html)) !== null) {
-    const srcset = match[1];
-    const sources = srcset.split(',').map(s => s.trim().split(/\s+/)[0]);
-    for (const src of sources) {
-      if (src && !shouldSkipImage(src)) {
-        images.push(src);
-      }
-    }
+function extractImagesFromHtml(html: string): string[] {
+  const images: string[] = [];
+  const imgTagRegex = /<img\b[^>]*>/gi;
+  let match;
+  while ((match = imgTagRegex.exec(html)) !== null) {
+    const best = bestSourceForImgTag(match[0]);
+    if (best) images.push(best);
   }
 
   // Match background-image in style attributes
@@ -55,7 +78,7 @@ function extractImagesFromHtml(html: string): string[] {
     }
   }
 
-  return [...new Set(images)];
+  return dedupeByCanonical(images);
 }
 
 function extractImagesFromItem(item: Element, _namespaces: Record<string, string>): string[] {
@@ -154,7 +177,7 @@ function extractImagesFromItem(item: Element, _namespaces: Record<string, string
     }
   }
 
-  return [...new Set(images)];
+  return dedupeByCanonical(images);
 }
 
 function getTextContent(element: Element | null): string {

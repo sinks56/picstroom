@@ -53,10 +53,14 @@ export default defineConfig({
               cacheName: 'images-cache',
               expiration: {
                 maxEntries: 500,
-                maxAgeSeconds: 60 * 60 * 24 * 30
+                maxAgeSeconds: 60 * 60 * 24 * 30,
+                purgeOnQuotaError: true
               },
+              // Only cache CORS (200) responses. Cross-origin <img> loads are opaque (status 0),
+              // and browsers count each opaque entry as ~7 MB of quota, so caching them
+              // filled storage after ~120 images and broke IndexedDB writes (QuotaExceededError).
               cacheableResponse: {
-                statuses: [0, 200]
+                statuses: [200]
               }
             }
           },
