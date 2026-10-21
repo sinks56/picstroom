@@ -5,6 +5,7 @@ export interface FeedImage {
   thumbnailUrl?: string;
   sourceUrl: string;
   title?: string;
+  guid?: string;
   width?: number;
   height?: number;
   pubDate?: number;
@@ -22,6 +23,8 @@ export interface Feed {
   order: number;
   lastFetched?: number;
   errorMessage?: string;
+  lastFetchedPage?: number;
+  noMorePages?: boolean;
 }
 
 export interface Folder {
@@ -68,6 +71,7 @@ export interface StarterFeed {
 export interface ParsedFeedItem {
   title?: string;
   link?: string;
+  guid?: string;
   images: string[];
   pubDate?: Date;
 }

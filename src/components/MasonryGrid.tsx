@@ -30,6 +30,7 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
   const [viewportHeight, setViewportHeight] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
   const loadedAspectRatios = useRef<Map<string, number>>(new Map());
+  const failedImages = useRef<Set<string>>(new Set());
   const prevImagesLength = useRef(images.length);
 
   const { ref: bottomRef, inView: bottomInView } = useInView({
@@ -66,21 +67,37 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
     prevImagesLength.current = images.length;
   }, [images.length, displayCount]);
 
-  // Track scroll position for virtualization
+  // Track scroll position for virtualization with rAF throttling
   useEffect(() => {
+    let rafId: number | null = null;
+    let lastScrollY = window.scrollY;
+    
     const handleScroll = () => {
-      setScrollY(window.scrollY);
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        const newScrollY = window.scrollY;
+        if (Math.abs(newScrollY - lastScrollY) > 10) {
+          lastScrollY = newScrollY;
+          setScrollY(newScrollY);
+        }
+        rafId = null;
+      });
+    };
+    
+    const handleResize = () => {
+      setViewportHeight(window.innerHeight);
     };
     
     setViewportHeight(window.innerHeight);
-    handleScroll();
+    setScrollY(window.scrollY);
     
     window.addEventListener('scroll', handleScroll, { passive: true });
-    window.addEventListener('resize', () => setViewportHeight(window.innerHeight));
+    window.addEventListener('resize', handleResize, { passive: true });
     
     return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
       window.removeEventListener('scroll', handleScroll);
-      window.removeEventListener('resize', () => setViewportHeight(window.innerHeight));
+      window.removeEventListener('resize', handleResize);
     };
   }, []);
 
@@ -112,7 +129,7 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
   }, [containerWidth, columnCount]);
 
   const displayedImages = useMemo(() => 
-    images.slice(0, displayCount),
+    images.slice(0, displayCount).filter(img => !failedImages.current.has(img.id)),
     [images, displayCount]
   );
 
@@ -127,8 +144,13 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
     const items: LayoutItem[] = [];
 
     displayedImages.forEach((image, index) => {
-      const cachedRatio = loadedAspectRatios.current.get(image.id);
-      const aspectRatio = cachedRatio || 1;
+      // Priority: cached ratio > stored dimensions > square default
+      let aspectRatio = loadedAspectRatios.current.get(image.id);
+      if (!aspectRatio && image.width && image.height) {
+        aspectRatio = image.width / image.height;
+      }
+      if (!aspectRatio) aspectRatio = 1; // Square default
+      
       const height = columnWidth / aspectRatio;
 
       const shortestColumn = columnHeights.indexOf(Math.min(...columnHeights));
@@ -156,6 +178,13 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
   const handleImageLoad = useCallback((imageId: string, aspectRatio: number) => {
     if (loadedAspectRatios.current.get(imageId) !== aspectRatio) {
       loadedAspectRatios.current.set(imageId, aspectRatio);
+      calculateLayout();
+    }
+  }, [calculateLayout]);
+
+  const handleImageError = useCallback((imageId: string) => {
+    if (!failedImages.current.has(imageId)) {
+      failedImages.current.add(imageId);
       calculateLayout();
     }
   }, [calculateLayout]);
@@ -200,8 +229,9 @@ export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
           <MasonryItem
             key={item.image.id}
             item={item}
-            onClick={() => onImageClick(item.image, images, item.index)}
+            onClick={() => onImageClick(item.image, displayedImages, item.index)}
             onLoad={handleImageLoad}
+            onError={handleImageError}
           />
         ))}
       </div>
@@ -245,9 +275,10 @@ interface MasonryItemProps {
   item: LayoutItem;
   onClick: () => void;
   onLoad: (imageId: string, aspectRatio: number) => void;
+  onError: (imageId: string) => void;
 }
 
-function MasonryItem({ item, onClick, onLoad }: MasonryItemProps) {
+function MasonryItem({ item, onClick, onLoad, onError }: MasonryItemProps) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(false);
 
@@ -256,6 +287,11 @@ function MasonryItem({ item, onClick, onLoad }: MasonryItemProps) {
     const aspectRatio = img.naturalWidth / img.naturalHeight;
     onLoad(item.image.id, aspectRatio);
     setLoaded(true);
+  };
+
+  const handleError = () => {
+    setError(true);
+    onError(item.image.id);
   };
 
   if (error) return null;
@@ -277,7 +313,7 @@ function MasonryItem({ item, onClick, onLoad }: MasonryItemProps) {
         src={item.image.thumbnailUrl || item.image.url}
         alt={item.image.title || 'Image'}
         onLoad={handleLoad}
-        onError={() => setError(true)}
+        onError={handleError}
         loading="lazy"
         decoding="async"
         className={`w-full h-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`}

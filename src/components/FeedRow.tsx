@@ -10,7 +10,7 @@ interface FeedRowProps {
 }
 
 const ROW_HEIGHT = 140;
-const VIRTUALIZATION_BUFFER = 400; // pixels left/right of viewport to render
+const VIRTUALIZATION_BUFFER = 400;
 
 export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -19,22 +19,35 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
   const [scrollLeft, setScrollLeft] = useState(0);
   const [containerWidth, setContainerWidth] = useState(0);
   const [imageWidths, setImageWidths] = useState<Map<string, number>>(new Map());
+  const [failedImages, setFailedImages] = useState<Set<string>>(new Set());
 
   const handleRefresh = (e: React.MouseEvent) => {
     e.stopPropagation();
     refreshFeed(feed.id);
   };
 
-  // Track scroll position
+  // Track scroll position with rAF throttling
   useEffect(() => {
     const container = scrollRef.current;
     if (!container) return;
 
+    let rafId: number | null = null;
+    let lastScrollLeft = container.scrollLeft;
+
     const handleScroll = () => {
-      setScrollLeft(container.scrollLeft);
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        const newScrollLeft = container.scrollLeft;
+        if (Math.abs(newScrollLeft - lastScrollLeft) > 5) {
+          lastScrollLeft = newScrollLeft;
+          setScrollLeft(newScrollLeft);
+        }
+        rafId = null;
+      });
     };
 
     setContainerWidth(container.offsetWidth);
+    setScrollLeft(container.scrollLeft);
     container.addEventListener('scroll', handleScroll, { passive: true });
 
     const resizeObserver = new ResizeObserver(() => {
@@ -43,6 +56,7 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
     resizeObserver.observe(container);
 
     return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
       container.removeEventListener('scroll', handleScroll);
       resizeObserver.disconnect();
     };
@@ -57,13 +71,34 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
     });
   }, []);
 
+  const handleImageError = useCallback((imageId: string) => {
+    setFailedImages(prev => {
+      if (prev.has(imageId)) return prev;
+      const next = new Set(prev);
+      next.add(imageId);
+      return next;
+    });
+  }, []);
+
+  // Filter out failed images and calculate positions
+  const validImages = useMemo(() => 
+    images.filter(img => !failedImages.has(img.id)),
+    [images, failedImages]
+  );
+
   // Calculate positions and which items are visible
   const { visibleItems, totalWidth } = useMemo(() => {
     let x = 0;
     const items: { image: FeedImage; index: number; x: number; width: number }[] = [];
     
-    images.forEach((image, index) => {
-      const width = imageWidths.get(image.id) || ROW_HEIGHT;
+    validImages.forEach((image, index) => {
+      // Priority: cached width > stored dimensions > square default
+      let width = imageWidths.get(image.id);
+      if (!width && image.width && image.height) {
+        width = Math.round(ROW_HEIGHT * (image.width / image.height));
+      }
+      if (!width) width = ROW_HEIGHT; // Square default
+      
       items.push({ image, index, x, width });
       x += width;
     });
@@ -77,7 +112,7 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
     });
 
     return { visibleItems: visible, totalWidth: x };
-  }, [images, imageWidths, scrollLeft, containerWidth]);
+  }, [validImages, imageWidths, scrollLeft, containerWidth]);
 
   if (images.length === 0 && !isLoading) {
     return (
@@ -158,8 +193,10 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
                 key={item.image.id}
                 image={item.image}
                 x={item.x}
-                onClick={() => onImageClick(item.image, images, item.index, feed.id)}
+                width={item.width}
+                onClick={() => onImageClick(item.image, validImages, item.index, feed.id)}
                 onWidthKnown={handleImageLoad}
+                onError={handleImageError}
               />
             ))}
           </div>
@@ -172,24 +209,29 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
 interface VirtualizedImageCardProps {
   image: FeedImage;
   x: number;
+  width: number;
   onClick: () => void;
   onWidthKnown: (imageId: string, width: number) => void;
+  onError: (imageId: string) => void;
 }
 
-function VirtualizedImageCard({ image, x, onClick, onWidthKnown }: VirtualizedImageCardProps) {
+function VirtualizedImageCard({ image, x, width, onClick, onWidthKnown, onError }: VirtualizedImageCardProps) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(false);
-  const [width, setWidth] = useState(ROW_HEIGHT);
 
   const handleLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
     const img = e.currentTarget;
     const { naturalWidth, naturalHeight } = img;
     if (naturalWidth && naturalHeight) {
       const calculatedWidth = Math.round(ROW_HEIGHT * (naturalWidth / naturalHeight));
-      setWidth(calculatedWidth);
       onWidthKnown(image.id, calculatedWidth);
     }
     setLoaded(true);
+  };
+
+  const handleError = () => {
+    setError(true);
+    onError(image.id);
   };
 
   if (error) return null;
@@ -209,7 +251,7 @@ function VirtualizedImageCard({ image, x, onClick, onWidthKnown }: VirtualizedIm
         src={image.thumbnailUrl || image.url}
         alt={image.title || 'Image'}
         onLoad={handleLoad}
-        onError={() => setError(true)}
+        onError={handleError}
         loading="lazy"
         decoding="async"
         className={`w-full h-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`}

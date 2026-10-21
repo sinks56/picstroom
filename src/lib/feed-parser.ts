@@ -205,6 +205,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
       for (const item of itemElements) {
         const itemTitle = getTextContent(item.querySelector('title'));
         const itemLink = getTextContent(item.querySelector('link'));
+        const itemGuid = getTextContent(item.querySelector('guid'));
         const pubDateStr = getTextContent(item.querySelector('pubDate'));
         const images = extractImagesFromItem(item, namespaces);
         
@@ -212,6 +213,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
           items.push({
             title: itemTitle,
             link: itemLink,
+            guid: itemGuid || undefined,
             images,
             pubDate: pubDateStr ? new Date(pubDateStr) : undefined
           });
@@ -235,6 +237,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
       for (const entry of entries) {
         const entryTitle = getTextContent(entry.querySelector('title'));
         const entryLink = getAtomLink(entry);
+        const entryId = getTextContent(entry.querySelector('id'));
         const publishedStr = getTextContent(entry.querySelector('published')) || 
                            getTextContent(entry.querySelector('updated'));
         const images = extractImagesFromItem(entry, namespaces);
@@ -243,6 +246,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
           items.push({
             title: entryTitle,
             link: entryLink,
+            guid: entryId || undefined,
             images,
             pubDate: publishedStr ? new Date(publishedStr) : undefined
           });
@@ -266,6 +270,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
       for (const item of itemElements) {
         const itemTitle = getTextContent(item.querySelector('title'));
         const itemLink = getTextContent(item.querySelector('link'));
+        const itemAbout = item.getAttribute('rdf:about');
         const dateStr = getTextContent(item.querySelector('date'));
         const images = extractImagesFromItem(item, namespaces);
 
@@ -273,6 +278,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
           items.push({
             title: itemTitle,
             link: itemLink,
+            guid: itemAbout || undefined,
             images,
             pubDate: dateStr ? new Date(dateStr) : undefined
           });

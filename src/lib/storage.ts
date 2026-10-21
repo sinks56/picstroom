@@ -3,7 +3,53 @@ import type { Feed, FeedImage, Folder, FavoriteImage, Settings } from '../types'
 import { DEFAULT_PROXIES } from './cors-proxy';
 
 const DB_NAME = 'picstroom';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
+
+function normalizeUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    let path = u.pathname.replace(/\/+$/, '');
+    const search = u.search;
+    return `${u.protocol}//${u.host}${path}${search}`.toLowerCase();
+  } catch {
+    return url.toLowerCase();
+  }
+}
+
+export function getDedupeKey(image: FeedImage): string {
+  if (image.guid) return `guid:${image.guid}`;
+  if (image.sourceUrl && image.url) {
+    return `link-img:${normalizeUrl(image.sourceUrl)}|${normalizeUrl(image.url)}`;
+  }
+  return `url:${normalizeUrl(image.url)}`;
+}
+
+export function dedupeImages(images: FeedImage[]): FeedImage[] {
+  const seen = new Map<string, FeedImage>();
+  for (const img of images) {
+    const key = getDedupeKey(img);
+    const existing = seen.get(key);
+    if (!existing || (img.pubDate && existing.pubDate && img.pubDate > existing.pubDate)) {
+      seen.set(key, img);
+    }
+  }
+  return Array.from(seen.values());
+}
+
+export function mergeImages(existing: FeedImage[], incoming: FeedImage[]): FeedImage[] {
+  const byKey = new Map<string, FeedImage>();
+  for (const img of existing) {
+    byKey.set(getDedupeKey(img), img);
+  }
+  for (const img of incoming) {
+    const key = getDedupeKey(img);
+    const old = byKey.get(key);
+    if (!old || (img.pubDate && old.pubDate && img.pubDate > old.pubDate)) {
+      byKey.set(key, img);
+    }
+  }
+  return Array.from(byKey.values());
+}
 
 interface PicStroomDB {
   feeds: Feed;
@@ -19,7 +65,7 @@ export async function initDB(): Promise<IDBPDatabase<any>> {
   if (db) return db;
 
   db = await openDB<PicStroomDB>(DB_NAME, DB_VERSION, {
-    upgrade(database) {
+    async upgrade(database, oldVersion, _newVersion, transaction) {
       // Feeds store
       if (!database.objectStoreNames.contains('feeds')) {
         const feedsStore = database.createObjectStore('feeds', { keyPath: 'id' });
@@ -49,6 +95,28 @@ export async function initDB(): Promise<IDBPDatabase<any>> {
       // Settings store (single object)
       if (!database.objectStoreNames.contains('settings')) {
         database.createObjectStore('settings', { keyPath: 'id' });
+      }
+
+      // Migration: v1 → v2: deduplicate existing images per feed
+      if (oldVersion < 2) {
+        const imagesStore = transaction.objectStore('images');
+        const feedsStore = transaction.objectStore('feeds');
+        
+        const feeds = await feedsStore.getAll();
+        for (const feed of feeds) {
+          const feedImages: FeedImage[] = await imagesStore.index('feedId').getAll(feed.id);
+          if (feedImages.length > 0) {
+            const deduped = dedupeImages(feedImages);
+            if (deduped.length < feedImages.length) {
+              const keepIds = new Set(deduped.map(img => img.id));
+              for (const img of feedImages) {
+                if (!keepIds.has(img.id)) {
+                  await imagesStore.delete(img.id);
+                }
+              }
+            }
+          }
+        }
       }
     }
   });
