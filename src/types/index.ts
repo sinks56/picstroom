@@ -7,6 +7,7 @@ export interface FeedImage {
   title?: string;
   width?: number;
   height?: number;
+  pubDate?: number;
   fetchedAt: number;
 }
 
@@ -54,6 +55,7 @@ export interface Settings {
   minImageHeight: number;
   customProxyUrl?: string;
   proxyList: ProxyConfig[];
+  timeWindowDays: number;
 }
 
 export interface StarterFeed {

@@ -6,7 +6,7 @@ import { ImageCard } from './ImageCard';
 interface FeedRowProps {
   feed: Feed;
   images: FeedImage[];
-  onImageClick: (image: FeedImage, allImages: FeedImage[], index: number) => void;
+  onImageClick: (image: FeedImage, allImages: FeedImage[], index: number, feedId?: string) => void;
   onManageFeed: () => void;
 }
 
@@ -93,7 +93,7 @@ export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowPro
             <ImageCard
               key={image.id}
               image={image}
-              onClick={() => onImageClick(image, images, index)}
+              onClick={() => onImageClick(image, images, index, feed.id)}
               size="medium"
             />
           ))

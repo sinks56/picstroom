@@ -4,7 +4,7 @@ import type { FeedImage } from '../types';
 
 interface MasonryGridProps {
   images: FeedImage[];
-  onImageClick: (image: FeedImage, allImages: FeedImage[], index: number) => void;
+  onImageClick: (image: FeedImage, allImages: FeedImage[], index: number, feedId?: string) => void;
 }
 
 const BATCH_SIZE = 40;

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">PicStroom</string>
+    <string name="title_activity_main">PicStroom</string>
+    <string name="package_name">io.github.sinks56.picstroom</string>
+    <string name="custom_url_scheme">io.github.sinks56.picstroom</string>
+</resources>

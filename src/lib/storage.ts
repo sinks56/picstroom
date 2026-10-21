@@ -63,7 +63,8 @@ export const DEFAULT_SETTINGS: Settings = {
   imageQuality: 'high',
   minImageWidth: 100,
   minImageHeight: 100,
-  proxyList: DEFAULT_PROXIES
+  proxyList: DEFAULT_PROXIES,
+  timeWindowDays: 14
 };
 
 export async function getSettings(): Promise<Settings> {
