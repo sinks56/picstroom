@@ -1,327 +1,161 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { useInView } from 'react-intersection-observer';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FeedImage } from '../types';
 import { useStore } from '../store';
+import { useViewport } from '../hooks/useViewport';
+import { aspectOf } from '../lib/thumbs';
+import { Thumb } from './Thumb';
 
 interface MasonryGridProps {
   images: FeedImage[];
   onImageClick: (image: FeedImage, allImages: FeedImage[], index: number, feedId?: string) => void;
 }
 
-const BATCH_SIZE = 40;
-const VIRTUALIZATION_BUFFER = 500; // pixels above/below viewport to render
+/** Never mount more cells than this, whatever the viewport/overscan says. */
+export const MAX_MOUNTED_CELLS = 90;
 
-interface LayoutItem {
+interface Cell {
   image: FeedImage;
   index: number;
   x: number;
   y: number;
-  width: number;
-  height: number;
+  w: number;
+  h: number;
+}
+
+export function columnsFor(width: number): number {
+  if (width < 600) return 2;
+  if (width < 900) return 3;
+  if (width < 1200) return 4;
+  return 5;
+}
+
+/**
+ * Shortest-column masonry using stored aspect ratios. Integer edges (x/w from rounded
+ * column boundaries, rounded heights) keep the grid gap-free.
+ */
+export function layoutMasonry(images: FeedImage[], width: number): { cells: Cell[]; height: number } {
+  const cols = columnsFor(width);
+  const colW = width / cols;
+  const edges = Array.from({ length: cols + 1 }, (_, i) => Math.round(i * colW));
+  const heights = new Array(cols).fill(0);
+  const cells: Cell[] = [];
+  images.forEach((image, index) => {
+    let c = 0;
+    for (let i = 1; i < cols; i++) if (heights[i] < heights[c]) c = i;
+    const w = edges[c + 1] - edges[c];
+    const h = Math.round(w / aspectOf(image, 1, 0.5, 2));
+    cells.push({ image, index, x: edges[c], y: heights[c], w, h });
+    heights[c] += h;
+  });
+  return { cells, height: Math.max(0, ...heights) };
 }
 
 export function MasonryGrid({ images, onImageClick }: MasonryGridProps) {
-  const { loadOlderPosts, loadingOlder, reachedEnd } = useStore();
-  const [displayCount, setDisplayCount] = useState(BATCH_SIZE);
-  const [containerWidth, setContainerWidth] = useState(0);
-  const [layout, setLayout] = useState<LayoutItem[]>([]);
-  const [containerHeight, setContainerHeight] = useState(0);
-  const [scrollY, setScrollY] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(0);
+  const loadOlderPosts = useStore(s => s.loadOlderPosts);
+  const olderStatus = useStore(s => s.olderStatus);
+  const useProxy = useStore(s => s.settings.optimizeImages !== false);
+  const viewport = useViewport(100);
   const containerRef = useRef<HTMLDivElement>(null);
-  const loadedAspectRatios = useRef<Map<string, number>>(new Map());
-  const failedImages = useRef<Set<string>>(new Set());
-  const prevImagesLength = useRef(images.length);
+  const [containerTop, setContainerTop] = useState(0);
+  const [width, setWidth] = useState(() => document.documentElement.clientWidth);
+  const [failed, setFailed] = useState<Set<string>>(() => new Set());
 
-  const { ref: bottomRef, inView: bottomInView } = useInView({
-    threshold: 0,
-    rootMargin: '400px'
-  });
-
-  const { ref: olderRef, inView: olderInView } = useInView({
-    threshold: 0,
-    rootMargin: '200px'
-  });
-
-  // Load more images when scrolling down
-  useEffect(() => {
-    if (bottomInView && displayCount < images.length) {
-      setDisplayCount(prev => Math.min(prev + BATCH_SIZE, images.length));
-    }
-  }, [bottomInView, displayCount, images.length]);
-
-  // Load older posts when reaching the end of current window
-  useEffect(() => {
-    if (olderInView && displayCount >= images.length && !loadingOlder && !reachedEnd) {
-      loadOlderPosts();
-    }
-  }, [olderInView, displayCount, images.length, loadingOlder, reachedEnd, loadOlderPosts]);
-
-  // Only reset displayCount when images actually shrink (feed removed), not when expanded
-  useEffect(() => {
-    if (images.length < prevImagesLength.current) {
-      setDisplayCount(Math.min(displayCount, Math.max(BATCH_SIZE, images.length)));
-    } else if (images.length > prevImagesLength.current && displayCount < BATCH_SIZE) {
-      setDisplayCount(BATCH_SIZE);
-    }
-    prevImagesLength.current = images.length;
-  }, [images.length, displayCount]);
-
-  // Track scroll position for virtualization with rAF throttling
-  useEffect(() => {
-    let rafId: number | null = null;
-    let lastScrollY = window.scrollY;
-    
-    const handleScroll = () => {
-      if (rafId !== null) return;
-      rafId = requestAnimationFrame(() => {
-        const newScrollY = window.scrollY;
-        if (Math.abs(newScrollY - lastScrollY) > 10) {
-          lastScrollY = newScrollY;
-          setScrollY(newScrollY);
-        }
-        rafId = null;
-      });
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      setContainerTop(rect.top + window.scrollY);
+      setWidth(Math.round(rect.width));
     };
-    
-    const handleResize = () => {
-      setViewportHeight(window.innerHeight);
-    };
-    
-    setViewportHeight(window.innerHeight);
-    setScrollY(window.scrollY);
-    
-    window.addEventListener('scroll', handleScroll, { passive: true });
-    window.addEventListener('resize', handleResize, { passive: true });
-    
-    return () => {
-      if (rafId !== null) cancelAnimationFrame(rafId);
-      window.removeEventListener('scroll', handleScroll);
-      window.removeEventListener('resize', handleResize);
-    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
+  const list = useMemo(() => (failed.size ? images.filter(i => !failed.has(i.id)) : images), [images, failed]);
+  const { cells, height } = useMemo(() => layoutMasonry(list, width || 1), [list, width]);
+
+  const visible = useMemo(() => {
+    const top = viewport.scrollY - containerTop - viewport.height;
+    const bottom = viewport.scrollY - containerTop + viewport.height * 2;
+    const out = cells.filter(c => c.y + c.h >= top && c.y <= bottom);
+    if (out.length <= MAX_MOUNTED_CELLS) return out;
+    const mid = viewport.scrollY - containerTop + viewport.height / 2;
+    return out
+      .sort((a, b) => Math.abs(a.y + a.h / 2 - mid) - Math.abs(b.y + b.h / 2 - mid))
+      .slice(0, MAX_MOUNTED_CELLS);
+  }, [cells, viewport.scrollY, viewport.height, containerTop]);
+
+  // Infinite scroll: ask for older posts when within ~2.5 screens of the end.
+  const nearEnd = viewport.scrollY + viewport.height * 2.5 >= containerTop + height;
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
+    if (nearEnd && olderStatus === 'idle' && list.length > 0) loadOlderPosts();
+  }, [nearEnd, olderStatus, list.length, loadOlderPosts]);
 
-    const updateWidth = () => {
-      setContainerWidth(container.offsetWidth);
-    };
+  const handleOpen = useCallback((image: FeedImage) => {
+    const idx = list.findIndex(i => i.id === image.id);
+    if (idx >= 0) onImageClick(image, list, idx);
+  }, [list, onImageClick]);
 
-    updateWidth();
-    const observer = new ResizeObserver(updateWidth);
-    observer.observe(container);
-
-    return () => observer.disconnect();
+  const handleFail = useCallback((id: string) => {
+    setFailed(prev => (prev.has(id) ? prev : new Set(prev).add(id)));
   }, []);
 
-  const columnCount = useMemo(() => {
-    if (containerWidth < 480) return 2;
-    if (containerWidth < 768) return 3;
-    if (containerWidth < 1024) return 4;
-    return 5;
-  }, [containerWidth]);
-
-  const columnWidth = useMemo(() => {
-    if (containerWidth === 0) return 0;
-    return containerWidth / columnCount;
-  }, [containerWidth, columnCount]);
-
-  const displayedImages = useMemo(() => 
-    images.slice(0, displayCount).filter(img => !failedImages.current.has(img.id)),
-    [images, displayCount]
-  );
-
-  const calculateLayout = useCallback(() => {
-    if (columnWidth === 0 || displayedImages.length === 0) {
-      setLayout([]);
-      setContainerHeight(0);
-      return;
-    }
-
-    const columnHeights = new Array(columnCount).fill(0);
-    const items: LayoutItem[] = [];
-
-    displayedImages.forEach((image, index) => {
-      // Priority: cached ratio > stored dimensions > square default
-      let aspectRatio = loadedAspectRatios.current.get(image.id);
-      if (!aspectRatio && image.width && image.height) {
-        aspectRatio = image.width / image.height;
+  // After the viewer closes, make sure the last viewed picture is on screen.
+  useEffect(() => {
+    const onReveal = (e: Event) => {
+      const id = (e as CustomEvent<{ imageId: string }>).detail?.imageId;
+      const cell = cells.find(c => c.image.id === id);
+      if (!cell) return;
+      const top = containerTop + cell.y;
+      const vh = window.innerHeight;
+      if (top < window.scrollY + 48 || top + cell.h > window.scrollY + vh) {
+        window.scrollTo({ top: Math.max(0, top - vh / 3), behavior: 'auto' });
       }
-      if (!aspectRatio) aspectRatio = 1; // Square default
-      
-      const height = columnWidth / aspectRatio;
-
-      const shortestColumn = columnHeights.indexOf(Math.min(...columnHeights));
-      
-      items.push({
-        image,
-        index,
-        x: shortestColumn * columnWidth,
-        y: columnHeights[shortestColumn],
-        width: columnWidth,
-        height
-      });
-
-      columnHeights[shortestColumn] += height;
-    });
-
-    setLayout(items);
-    setContainerHeight(Math.max(...columnHeights));
-  }, [columnWidth, columnCount, displayedImages]);
-
-  useEffect(() => {
-    calculateLayout();
-  }, [calculateLayout]);
-
-  const handleImageLoad = useCallback((imageId: string, aspectRatio: number) => {
-    if (loadedAspectRatios.current.get(imageId) !== aspectRatio) {
-      loadedAspectRatios.current.set(imageId, aspectRatio);
-      calculateLayout();
-    }
-  }, [calculateLayout]);
-
-  const handleImageError = useCallback((imageId: string) => {
-    if (!failedImages.current.has(imageId)) {
-      failedImages.current.add(imageId);
-      calculateLayout();
-    }
-  }, [calculateLayout]);
-
-  // Filter items to only render those in/near viewport (virtualization)
-  const visibleItems = useMemo(() => {
-    if (!containerRef.current) return layout;
-    
-    const containerTop = containerRef.current.offsetTop;
-    const viewTop = scrollY - VIRTUALIZATION_BUFFER;
-    const viewBottom = scrollY + viewportHeight + VIRTUALIZATION_BUFFER;
-    
-    return layout.filter(item => {
-      const itemTop = containerTop + item.y;
-      const itemBottom = itemTop + item.height;
-      return itemBottom >= viewTop && itemTop <= viewBottom;
-    });
-  }, [layout, scrollY, viewportHeight]);
+    };
+    window.addEventListener('picstroom:reveal', onReveal);
+    return () => window.removeEventListener('picstroom:reveal', onReveal);
+  }, [cells, containerTop]);
 
   if (images.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-20 px-4 text-center">
-        <svg className="w-12 h-12 text-[var(--color-text-muted)] mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
-        </svg>
-        <h3 className="text-base font-medium mb-1">No images yet</h3>
-        <p className="text-[var(--color-text-muted)] text-sm">
-          Add some feeds to start browsing
-        </p>
+        <h3 className="text-sm font-medium mb-1">No images in this time window</h3>
+        <button className="text-xs text-[var(--color-accent)]" onClick={() => loadOlderPosts()}>Load older posts</button>
       </div>
     );
   }
 
   return (
-    <div className="pb-4">
-      <div 
-        ref={containerRef}
-        className="relative w-full"
-        style={{ height: containerHeight || 'auto' }}
-      >
-        {visibleItems.map((item) => (
-          <MasonryItem
-            key={item.image.id}
-            item={item}
-            onClick={() => onImageClick(item.image, displayedImages, item.index)}
-            onLoad={handleImageLoad}
-            onError={handleImageError}
+    <div>
+      <div ref={containerRef} className="relative w-full" style={{ height }} data-testid="grid">
+        {visible.map(cell => (
+          <Thumb
+            key={cell.image.id}
+            image={cell.image}
+            cssWidth={cell.w}
+            useProxy={useProxy}
+            style={{ left: cell.x, top: cell.y, width: cell.w, height: cell.h }}
+            onOpen={handleOpen}
+            onFail={handleFail}
           />
         ))}
       </div>
-
-      {/* Loading more from current batch */}
-      {displayCount < images.length && (
-        <div ref={bottomRef} className="flex justify-center py-4">
-          <div className="flex items-center gap-2 text-[var(--color-text-muted)] text-sm">
-            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-            </svg>
-            <span>Loading...</span>
-          </div>
-        </div>
-      )}
-
-      {/* Loading older posts / end state */}
-      {displayCount >= images.length && (
-        <div ref={olderRef} className="flex justify-center py-6">
-          {loadingOlder ? (
-            <div className="flex items-center gap-2 text-[var(--color-text-muted)] text-sm">
-              <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-              </svg>
-              <span>Loading older posts...</span>
-            </div>
-          ) : reachedEnd ? (
-            <div className="text-[var(--color-text-muted)] text-xs">
-              No more posts
-            </div>
-          ) : null}
-        </div>
-      )}
+      <ListEnd status={olderStatus} onRetry={() => loadOlderPosts({ force: true })} />
     </div>
   );
 }
 
-interface MasonryItemProps {
-  item: LayoutItem;
-  onClick: () => void;
-  onLoad: (imageId: string, aspectRatio: number) => void;
-  onError: (imageId: string) => void;
-}
-
-function MasonryItem({ item, onClick, onLoad, onError }: MasonryItemProps) {
-  const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState(false);
-
-  const handleLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
-    const img = e.currentTarget;
-    const aspectRatio = img.naturalWidth / img.naturalHeight;
-    onLoad(item.image.id, aspectRatio);
-    setLoaded(true);
-  };
-
-  const handleError = () => {
-    setError(true);
-    onError(item.image.id);
-  };
-
-  if (error) return null;
-
+export function ListEnd({ status, onRetry }: { status: string; onRetry: () => void }) {
   return (
-    <div
-      onClick={onClick}
-      className="absolute overflow-hidden cursor-pointer bg-[var(--color-bg-tertiary)]"
-      style={{
-        left: item.x,
-        top: item.y,
-        width: item.width,
-        height: item.height,
-        transform: 'translateZ(0)',
-        willChange: 'transform'
-      }}
-    >
-      <img
-        src={item.image.thumbnailUrl || item.image.url}
-        alt={item.image.title || 'Image'}
-        onLoad={handleLoad}
-        onError={handleError}
-        loading="lazy"
-        decoding="async"
-        className={`w-full h-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`}
-      />
-
-      {!loaded && !error && (
-        <div className="absolute inset-0 animate-pulse bg-[var(--color-bg-tertiary)]" />
+    <div className="flex justify-center items-center h-16 text-[11px] text-[var(--color-text-muted)]" data-testid="list-end" data-status={status}>
+      {status === 'loading' && <span className="ps-spinner" aria-label="Loading older posts" />}
+      {status === 'waiting' && (
+        <button onClick={onRetry} className="px-3 py-1 border border-[var(--color-border)]">Couldn't load older posts · Retry</button>
       )}
+      {status === 'end' && <span>No more posts</span>}
     </div>
   );
 }

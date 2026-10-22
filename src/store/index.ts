@@ -8,629 +8,471 @@ import {
   getFeeds,
   saveFeed,
   deleteFeed as deleteFeedFromDB,
-  getImagesByFeed,
   getAllImages,
-  saveImages,
-  clearFeedImages,
+  upsertImages,
+  deleteImages,
   getFolders,
   saveFolder,
   deleteFolder as deleteFolderFromDB,
   getFavorites,
   addFavorite,
   removeFavorite,
-  DEFAULT_SETTINGS,
-  dedupeImages,
-  mergeImages
+  DEFAULT_SETTINGS
 } from '../lib/storage';
 import { fetchWithCorsProxy } from '../lib/cors-proxy';
 import { parseFeed, discoverFeedUrl, isFeedUrl } from '../lib/feed-parser';
-import { imageCache } from '../lib/image-cache';
+import {
+  buildFeedImages,
+  mergeImages,
+  pruneImages,
+  sortByDateDesc,
+  nextMultiplierRevealingOlder,
+  buildPagedUrl,
+  pagingState,
+  applyPageOutcome,
+  runLimited,
+  type PageOutcome
+} from '../lib/collections';
+import { logDiag } from '../lib/diagnostics';
 
-const TIME_WINDOW_CHUNK_DAYS = 14;
-
-function buildPagedUrl(feedUrl: string, page: number): string {
-  try {
-    const url = new URL(feedUrl);
-    // WordPress-style feeds use ?paged=N or /page/N
-    if (url.pathname.includes('/feed')) {
-      // For /feed, /feed/, /category/xyz/feed, etc.
-      if (url.search) {
-        url.searchParams.set('paged', String(page));
-      } else {
-        url.searchParams.set('paged', String(page));
-      }
-    } else if (url.search.includes('feed=')) {
-      // For ?feed=rss2 style
-      url.searchParams.set('paged', String(page));
-    } else {
-      // Generic: just append paged parameter
-      url.searchParams.set('paged', String(page));
-    }
-    return url.toString();
-  } catch {
-    // Fallback: append as query param
-    const sep = feedUrl.includes('?') ? '&' : '?';
-    return `${feedUrl}${sep}paged=${page}`;
-  }
-}
-
-function filterImagesByTimeWindow(images: FeedImage[], windowMultiplier: number): FeedImage[] {
-  const windowDays = TIME_WINDOW_CHUNK_DAYS * windowMultiplier;
-  if (windowDays <= 0) return images;
-  const cutoff = Date.now() - (windowDays * 24 * 60 * 60 * 1000);
-  return images.filter(img => {
-    const date = img.pubDate || img.fetchedAt;
-    return date >= cutoff;
-  });
-}
+export type OlderStatus = 'idle' | 'loading' | 'waiting' | 'end';
 
 interface AppState {
   initialized: boolean;
+  initError: string | null;
   settings: Settings;
   feeds: Feed[];
   folders: Folder[];
   favorites: FavoriteImage[];
+  favoriteIds: Set<string>;
+  /** Per feed, newest first. */
   imagesByFeed: Record<string, FeedImage[]>;
+  /** All feeds, newest first. */
   allImages: FeedImage[];
   loadingFeeds: Set<string>;
+  refreshProgress: { done: number; total: number } | null;
   error: string | null;
-  
-  // Time window state
+
+  /** Visible time window, in 14-day chunks. */
   timeWindowMultiplier: number;
-  loadingOlder: boolean;
-  reachedEnd: boolean;
+  olderStatus: OlderStatus;
 
-  // Cached filtered results (memoized)
-  _cachedFilteredByFeed: Record<string, FeedImage[]> | null;
-  _cachedFilteredAll: FeedImage[] | null;
-  _cacheKey: string;
-
-  // Computed (with memoization)
-  filteredImagesByFeed: () => Record<string, FeedImage[]>;
-  filteredAllImages: () => FeedImage[];
-
-  // Actions
   initialize: () => Promise<void>;
   updateSettings: (settings: Partial<Settings>) => Promise<void>;
-  loadOlderPosts: () => Promise<void>;
-  
+  loadOlderPosts: (opts?: { force?: boolean }) => Promise<void>;
+
   addFeed: (urlOrFeedUrl: string, customTitle?: string) => Promise<Feed | null>;
   updateFeed: (feedId: string, updates: Partial<Feed>) => Promise<void>;
   removeFeed: (feedId: string) => Promise<void>;
   refreshFeed: (feedId: string) => Promise<void>;
   refreshAllFeeds: () => Promise<void>;
   reorderFeed: (feedId: string, newIndex: number) => Promise<void>;
-  
+
   addFolder: (name: string) => Promise<Folder>;
   updateFolder: (folderId: string, updates: Partial<Folder>) => Promise<void>;
   removeFolder: (folderId: string) => Promise<void>;
   toggleFolderCollapsed: (folderId: string) => Promise<void>;
-  
+
   toggleFavorite: (image: FeedImage) => Promise<void>;
   isFavorited: (imageId: string) => boolean;
-  
+
   clearError: () => void;
 }
 
-export const useStore = create<AppState>((set, get) => ({
-  initialized: false,
-  settings: DEFAULT_SETTINGS,
-  feeds: [],
-  folders: [],
-  favorites: [],
-  imagesByFeed: {},
-  allImages: [],
-  loadingFeeds: new Set(),
-  error: null,
-  timeWindowMultiplier: 1,
-  loadingOlder: false,
-  reachedEnd: false,
-  _cachedFilteredByFeed: null,
-  _cachedFilteredAll: null,
-  _cacheKey: '',
+function applyTheme(theme: Settings['theme']) {
+  const dark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.classList.toggle('dark', dark);
+}
 
-  filteredImagesByFeed: () => {
-    const { imagesByFeed, timeWindowMultiplier, _cachedFilteredByFeed, _cacheKey } = get();
-    // Include first few image IDs per feed to detect content changes, not just count
-    const feedHashes = Object.entries(imagesByFeed).map(([fid, imgs]) => {
-      const idSample = imgs.slice(0, 3).map(i => i.id).join('|');
-      return `${fid}:${imgs.length}:${idSample}`;
-    }).join(';');
-    const newKey = `byFeed-${timeWindowMultiplier}-${feedHashes}`;
-    
-    if (_cacheKey === newKey && _cachedFilteredByFeed) {
-      return _cachedFilteredByFeed;
+function rebuildAll(imagesByFeed: Record<string, FeedImage[]>): FeedImage[] {
+  // Each feed is already deduplicated; cross-feed duplicates are rare and harmless.
+  return sortByDateDesc(Object.values(imagesByFeed).flat());
+}
+
+export const useStore = create<AppState>((set, get) => {
+  /**
+   * Merge freshly fetched images into a feed: in-memory state first (so the UI updates),
+   * then persist only new/changed records and drop the overflow beyond the per-feed cap.
+   */
+  async function mergeIntoFeed(feedId: string, incoming: FeedImage[]): Promise<number> {
+    const existing = get().imagesByFeed[feedId] || [];
+    const { merged, changed, added } = mergeImages(existing, incoming);
+    if (!changed.length) return 0;
+    const { kept, pruned } = pruneImages(merged);
+    const prunedIds = new Set(pruned.map(p => p.id));
+    set(state => {
+      if (!state.feeds.some(f => f.id === feedId)) return {}; // removed meanwhile
+      const imagesByFeed = { ...state.imagesByFeed, [feedId]: kept };
+      return { imagesByFeed, allImages: rebuildAll(imagesByFeed) };
+    });
+    try {
+      await upsertImages(changed.filter(c => !prunedIds.has(c.id)));
+      await deleteImages(pruned.filter(p => existing.some(e => e.id === p.id)).map(p => p.id));
+    } catch (e) {
+      logDiag('error', 'Saving images failed', e);
     }
-    
-    const result: Record<string, FeedImage[]> = {};
-    for (const [feedId, images] of Object.entries(imagesByFeed)) {
-      result[feedId] = filterImagesByTimeWindow(images, timeWindowMultiplier);
-    }
-    
-    set({ _cachedFilteredByFeed: result, _cacheKey: newKey });
-    return result;
-  },
+    return added;
+  }
 
-  filteredAllImages: () => {
-    const { allImages, timeWindowMultiplier, _cachedFilteredAll, _cacheKey } = get();
-    // Include sample of image IDs to detect content changes
-    const idSample = allImages.slice(0, 5).map(i => i.id).join('|');
-    const newKey = `all-${timeWindowMultiplier}-${allImages.length}-${idSample}`;
-    
-    if (_cacheKey === newKey && _cachedFilteredAll) {
-      return _cachedFilteredAll;
-    }
-    
-    const result = filterImagesByTimeWindow(allImages, timeWindowMultiplier);
-    set({ _cachedFilteredAll: result, _cacheKey: newKey });
-    return result;
-  },
+  let retryTimer: number | undefined;
+  /** When paging is in backoff, flip back to 'idle' once the earliest retry is due. */
+  function scheduleRetry() {
+    if (retryTimer) clearTimeout(retryTimer);
+    const now = Date.now();
+    const due = get().feeds.map(f => f.nextPageRetryAt || 0).filter(t => t > now);
+    const wait = due.length ? Math.min(...due) - now + 50 : 30_000;
+    retryTimer = window.setTimeout(() => {
+      retryTimer = undefined;
+      if (get().olderStatus === 'waiting') set({ olderStatus: 'idle' });
+    }, wait);
+  }
 
-  loadOlderPosts: async () => {
-    const { loadingOlder, reachedEnd, allImages, timeWindowMultiplier, feeds, settings } = get();
-    if (loadingOlder || reachedEnd) return;
+  async function fetchParsed(url: string) {
+    const { settings } = get();
+    const result = await fetchWithCorsProxy(url, settings.proxyList, settings.customProxyUrl);
+    if (!result.ok || !result.text) return { ok: false as const, error: result.error || 'Failed to fetch' };
+    // Parsing a large feed is synchronous; give the frame a chance to render first.
+    await new Promise(r => setTimeout(r, 0));
+    const parsed = parseFeed(result.text);
+    if (!parsed) return { ok: false as const, error: 'Failed to parse feed' };
+    return { ok: true as const, parsed };
+  }
 
-    set({ loadingOlder: true });
+  return {
+    initialized: false,
+    initError: null,
+    settings: DEFAULT_SETTINGS,
+    feeds: [],
+    folders: [],
+    favorites: [],
+    favoriteIds: new Set(),
+    imagesByFeed: {},
+    allImages: [],
+    loadingFeeds: new Set(),
+    refreshProgress: null,
+    error: null,
+    timeWindowMultiplier: 1,
+    olderStatus: 'idle',
 
-    const newMultiplier = timeWindowMultiplier + 1;
-    const currentFiltered = filterImagesByTimeWindow(allImages, timeWindowMultiplier);
-    const newFiltered = filterImagesByTimeWindow(allImages, newMultiplier);
-
-    // First try revealing more stored images
-    if (newFiltered.length > currentFiltered.length) {
-      set({ 
-        timeWindowMultiplier: newMultiplier, 
-        loadingOlder: false,
-        _cachedFilteredByFeed: null,
-        _cachedFilteredAll: null,
-        _cacheKey: ''
-      });
-      return;
-    }
-
-    // No more stored images - try fetching older pages from feeds
-    const feedsToFetch = feeds.filter(f => !f.noMorePages);
-    if (feedsToFetch.length === 0) {
-      set({ loadingOlder: false, reachedEnd: true });
-      return;
-    }
-
-    let anyNewImages = false;
-    for (const feed of feedsToFetch) {
-      const nextPage = (feed.lastFetchedPage || 1) + 1;
-      const pagedUrl = buildPagedUrl(feed.url, nextPage);
-      
+    initialize: async () => {
       try {
-        const result = await fetchWithCorsProxy(pagedUrl, settings.proxyList, settings.customProxyUrl);
-        if (!result.ok || !result.text) {
-          await get().updateFeed(feed.id, { noMorePages: true });
-          continue;
+        await initDB();
+        const [settings, feeds, folders, favorites, images] = await Promise.all([
+          getSettings(),
+          getFeeds(),
+          getFolders(),
+          getFavorites(),
+          getAllImages()
+        ]);
+
+        const feedIds = new Set(feeds.map(f => f.id));
+        const grouped: Record<string, FeedImage[]> = {};
+        const orphanIds: string[] = [];
+        for (const img of images) {
+          if (!feedIds.has(img.feedId)) { orphanIds.push(img.id); continue; }
+          (grouped[img.feedId] ||= []).push(img);
+        }
+        const imagesByFeed: Record<string, FeedImage[]> = {};
+        const prunedIds: string[] = [];
+        for (const feed of feeds) {
+          const { kept, pruned } = pruneImages(grouped[feed.id] || []);
+          imagesByFeed[feed.id] = kept;
+          prunedIds.push(...pruned.map(p => p.id));
         }
 
-        const parsed = parseFeed(result.text);
-        if (!parsed || parsed.items.length === 0) {
-          await get().updateFeed(feed.id, { noMorePages: true });
-          continue;
-        }
+        set({
+          initialized: true,
+          settings,
+          feeds,
+          folders,
+          favorites,
+          favoriteIds: new Set(favorites.map(f => f.imageId)),
+          imagesByFeed,
+          allImages: rebuildAll(imagesByFeed)
+        });
+        applyTheme(settings.theme);
 
-        // Extract images from parsed feed
-        const rawImages: FeedImage[] = [];
-        for (const item of parsed.items) {
-          for (const imgUrl of item.images) {
-            rawImages.push({
-              id: uuid(),
-              feedId: feed.id,
-              url: imgUrl,
-              sourceUrl: item.link || feed.url,
-              title: item.title,
-              guid: item.guid,
-              pubDate: item.pubDate ? item.pubDate.getTime() : undefined,
-              fetchedAt: Date.now()
-            });
-          }
-        }
-
-        if (rawImages.length === 0) {
-          await get().updateFeed(feed.id, { noMorePages: true });
-          continue;
-        }
-
-        const newImages = dedupeImages(rawImages);
-        const existingImages = get().imagesByFeed[feed.id] || [];
-        const mergedImages = mergeImages(existingImages, newImages);
-
-        // Check if we got any genuinely new images
-        if (mergedImages.length > existingImages.length) {
-          anyNewImages = true;
-          await clearFeedImages(feed.id);
-          await saveImages(mergedImages);
-          await get().updateFeed(feed.id, { lastFetchedPage: nextPage });
-
-          set(state => {
-            const otherImages = state.allImages.filter(img => img.feedId !== feed.id);
-            const newAllImages = dedupeImages([...mergedImages, ...otherImages]);
-            return {
-              imagesByFeed: { ...state.imagesByFeed, [feed.id]: mergedImages },
-              allImages: newAllImages.sort((a, b) => (b.pubDate || b.fetchedAt) - (a.pubDate || a.fetchedAt)),
-              _cachedFilteredByFeed: null,
-              _cachedFilteredAll: null,
-              _cacheKey: ''
-            };
-          });
-        } else {
-          await get().updateFeed(feed.id, { noMorePages: true });
+        if (orphanIds.length || prunedIds.length) {
+          // Housekeeping off the critical path.
+          setTimeout(() => {
+            deleteImages([...orphanIds, ...prunedIds]).catch(e => logDiag('warn', 'Prune failed', e));
+          }, 3000);
         }
       } catch (error) {
-        console.error(`Error fetching page ${nextPage} for ${feed.title}:`, error);
-        await get().updateFeed(feed.id, { noMorePages: true });
+        logDiag('error', 'Failed to initialize', error);
+        set({ initialized: true, initError: error instanceof Error ? error.message : String(error), error: 'Failed to load saved data' });
       }
-    }
+    },
 
-    // Extend time window if we got new images
-    if (anyNewImages) {
-      set(state => ({ 
-        timeWindowMultiplier: state.timeWindowMultiplier + 1,
-        loadingOlder: false,
-        _cachedFilteredByFeed: null,
-        _cachedFilteredAll: null,
-        _cacheKey: ''
-      }));
-    } else {
-      set({ loadingOlder: false, reachedEnd: true });
-    }
-  },
-
-  initialize: async () => {
-    try {
-      await Promise.all([initDB(), imageCache.init()]);
-      const [settings, feeds, folders, favorites] = await Promise.all([
-        getSettings(),
-        getFeeds(),
-        getFolders(),
-        getFavorites()
-      ]);
-
-      // Load images for each feed
-      const imagesByFeed: Record<string, FeedImage[]> = {};
-      for (const feed of feeds) {
-        const images = await getImagesByFeed(feed.id);
-        imagesByFeed[feed.id] = images;
+    updateSettings: async (updates) => {
+      const newSettings = { ...get().settings, ...updates };
+      set({ settings: newSettings });
+      applyTheme(newSettings.theme);
+      try {
+        await saveSettings(newSettings);
+      } catch (e) {
+        logDiag('error', 'Saving settings failed', e);
       }
+    },
 
-      const allImages = await getAllImages();
+    loadOlderPosts: async (opts) => {
+      const { olderStatus } = get();
+      if (olderStatus === 'loading') return;
+      set({ olderStatus: 'loading' });
+      const force = !!opts?.force;
 
-      set({
-        initialized: true,
-        settings,
-        feeds,
-        folders,
-        favorites,
-        imagesByFeed,
-        allImages
-      });
+      try {
+        // 1. Reveal stored images beyond the window (jumping over empty fortnights).
+        const reveal = nextMultiplierRevealingOlder(get().allImages, get().timeWindowMultiplier);
+        if (reveal !== null) {
+          set({ timeWindowMultiplier: reveal, olderStatus: 'idle' });
+          return;
+        }
 
-      // Apply theme
-      const { theme } = settings;
-      if (theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-        document.documentElement.classList.add('dark');
-      } else {
-        document.documentElement.classList.remove('dark');
+        // 2. Fetch the next archive page of each eligible feed.
+        const now = Date.now();
+        const feeds = get().feeds;
+        const eligible = feeds.filter(f => {
+          const st = pagingState(f, now);
+          return st === 'eligible' || (force && st === 'backoff');
+        });
+        if (!eligible.length) {
+          const waiting = feeds.some(f => pagingState(f, now) === 'backoff');
+          set({ olderStatus: waiting ? 'waiting' : 'end' });
+          if (waiting) scheduleRetry();
+          return;
+        }
+
+        await runLimited(eligible, 3, async feed => {
+          const page = (feed.lastFetchedPage || 1) + 1;
+          let outcome: PageOutcome;
+          try {
+            const res = await fetchParsed(buildPagedUrl(feed.url, page));
+            if (!res.ok) {
+              outcome = { kind: 'failed' };
+            } else if (!res.parsed.items.length) {
+              outcome = { kind: 'empty' };
+            } else {
+              const added = await mergeIntoFeed(feed.id, buildFeedImages(res.parsed, feed));
+              // A feed that ignores ?paged= returns page 1 again: nothing new means the end.
+              outcome = added > 0 ? { kind: 'added', page } : { kind: 'empty' };
+            }
+          } catch (e) {
+            logDiag('warn', `Paging ${feed.title} p${page} failed`, e);
+            outcome = { kind: 'failed' };
+          }
+          const current = get().feeds.find(f => f.id === feed.id);
+          if (current) await get().updateFeed(feed.id, applyPageOutcome(current, outcome));
+        });
+
+        const after = nextMultiplierRevealingOlder(get().allImages, get().timeWindowMultiplier);
+        if (after !== null) {
+          set({ timeWindowMultiplier: after, olderStatus: 'idle' });
+          return;
+        }
+        const t = Date.now();
+        const states = get().feeds.map(f => pagingState(f, t));
+        const status: OlderStatus = states.includes('eligible') ? 'idle' : states.includes('backoff') ? 'waiting' : 'end';
+        set({ olderStatus: status });
+        if (status === 'waiting') scheduleRetry();
+      } catch (e) {
+        logDiag('error', 'loadOlderPosts failed', e);
+        set({ olderStatus: 'waiting' });
+        scheduleRetry();
       }
-    } catch (error) {
-      console.error('Failed to initialize:', error);
-      set({ error: 'Failed to initialize app' });
-    }
-  },
+    },
 
-  updateSettings: async (updates) => {
-    const { settings } = get();
-    const newSettings = { ...settings, ...updates };
-    await saveSettings(newSettings);
-    set({ settings: newSettings });
+    addFeed: async (urlOrFeedUrl, customTitle) => {
+      const { settings } = get();
+      let feedUrl = urlOrFeedUrl.trim();
+      if (!/^https?:\/\//i.test(feedUrl)) feedUrl = 'https://' + feedUrl;
 
-    // Apply theme
-    const { theme } = newSettings;
-    if (theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
-  },
-
-  addFeed: async (urlOrFeedUrl, customTitle) => {
-    const { feeds, settings } = get();
-    let feedUrl = urlOrFeedUrl.trim();
-
-    // Ensure URL has protocol
-    if (!feedUrl.startsWith('http://') && !feedUrl.startsWith('https://')) {
-      feedUrl = 'https://' + feedUrl;
-    }
-
-    try {
-      // Check if it's a feed URL or site URL
-      if (!isFeedUrl(feedUrl)) {
-        // Try to discover feed from site
-        const result = await fetchWithCorsProxy(feedUrl, settings.proxyList, settings.customProxyUrl);
-        if (result.ok && result.text) {
-          const discoveredUrl = await discoverFeedUrl(result.text, feedUrl);
-          if (discoveredUrl) {
-            feedUrl = discoveredUrl;
+      try {
+        if (!isFeedUrl(feedUrl)) {
+          const result = await fetchWithCorsProxy(feedUrl, settings.proxyList, settings.customProxyUrl);
+          if (result.ok && result.text) {
+            const discoveredUrl = await discoverFeedUrl(result.text, feedUrl);
+            if (discoveredUrl) feedUrl = discoveredUrl;
           }
         }
-      }
-
-      // Fetch the feed
-      const result = await fetchWithCorsProxy(feedUrl, settings.proxyList, settings.customProxyUrl);
-      if (!result.ok || !result.text) {
-        set({ error: `Failed to fetch feed: ${result.error || 'Unknown error'}` });
-        return null;
-      }
-
-      const parsed = parseFeed(result.text);
-      if (!parsed) {
-        set({ error: 'Could not parse feed. Make sure the URL points to a valid RSS or Atom feed.' });
-        return null;
-      }
-
-      // Check if feed already exists
-      if (feeds.some(f => f.url === feedUrl)) {
-        set({ error: 'This feed has already been added.' });
-        return null;
-      }
-
-      const feed: Feed = {
-        id: uuid(),
-        url: feedUrl,
-        title: customTitle || parsed.title || 'Untitled Feed',
-        siteUrl: parsed.siteUrl,
-        description: parsed.description,
-        order: feeds.length,
-        lastFetched: Date.now()
-      };
-
-      await saveFeed(feed);
-
-      // Extract and save images
-      const rawImages: FeedImage[] = [];
-      for (const item of parsed.items) {
-        for (const imgUrl of item.images) {
-          rawImages.push({
-            id: uuid(),
-            feedId: feed.id,
-            url: imgUrl,
-            sourceUrl: item.link || feedUrl,
-            title: item.title,
-            guid: item.guid,
-            pubDate: item.pubDate ? item.pubDate.getTime() : undefined,
-            fetchedAt: Date.now()
-          });
+        if (get().feeds.some(f => f.url === feedUrl)) {
+          set({ error: 'This feed has already been added.' });
+          return null;
         }
-      }
 
-      const images = dedupeImages(rawImages);
+        const res = await fetchParsed(feedUrl);
+        if (!res.ok) {
+          set({ error: res.error.startsWith('Failed to parse') ? 'Could not parse feed. Make sure the URL points to a valid RSS or Atom feed.' : `Failed to fetch feed: ${res.error}` });
+          return null;
+        }
+        if (get().feeds.some(f => f.url === feedUrl)) return null; // added concurrently
 
-      if (images.length > 0) {
-        await saveImages(images);
-      }
-
-      set(state => {
-        const newAllImages = dedupeImages([...images, ...state.allImages]);
-        return {
+        const feed: Feed = {
+          id: uuid(),
+          url: feedUrl,
+          title: customTitle || res.parsed.title || 'Untitled Feed',
+          siteUrl: res.parsed.siteUrl,
+          description: res.parsed.description,
+          order: get().feeds.length,
+          lastFetched: Date.now()
+        };
+        await saveFeed(feed);
+        set(state => ({
           feeds: [...state.feeds, feed],
-          imagesByFeed: { ...state.imagesByFeed, [feed.id]: images },
-          allImages: newAllImages.sort((a, b) => (b.pubDate || b.fetchedAt) - (a.pubDate || a.fetchedAt)),
-          _cachedFilteredByFeed: null,
-          _cachedFilteredAll: null,
-          _cacheKey: ''
-        };
-      });
-
-      return feed;
-    } catch (error) {
-      console.error('Error adding feed:', error);
-      set({ error: 'Failed to add feed. Please check the URL and try again.' });
-      return null;
-    }
-  },
-
-  updateFeed: async (feedId, updates) => {
-    const { feeds } = get();
-    const feed = feeds.find(f => f.id === feedId);
-    if (!feed) return;
-
-    const updatedFeed = { ...feed, ...updates };
-    await saveFeed(updatedFeed);
-
-    set(state => ({
-      feeds: state.feeds.map(f => f.id === feedId ? updatedFeed : f)
-    }));
-  },
-
-  removeFeed: async (feedId) => {
-    await deleteFeedFromDB(feedId);
-
-    set(state => ({
-      feeds: state.feeds.filter(f => f.id !== feedId),
-      imagesByFeed: Object.fromEntries(
-        Object.entries(state.imagesByFeed).filter(([id]) => id !== feedId)
-      ),
-      allImages: state.allImages.filter(img => img.feedId !== feedId)
-    }));
-  },
-
-  refreshFeed: async (feedId) => {
-    const { feeds, settings, loadingFeeds } = get();
-    const feed = feeds.find(f => f.id === feedId);
-    if (!feed || loadingFeeds.has(feedId)) return;
-
-    set(state => ({
-      loadingFeeds: new Set([...state.loadingFeeds, feedId])
-    }));
-
-    try {
-      const result = await fetchWithCorsProxy(feed.url, settings.proxyList, settings.customProxyUrl);
-      if (!result.ok || !result.text) {
-        await get().updateFeed(feedId, { errorMessage: result.error || 'Failed to fetch' });
-        return;
+          imagesByFeed: { ...state.imagesByFeed, [feed.id]: [] },
+          olderStatus: 'idle'
+        }));
+        await mergeIntoFeed(feed.id, buildFeedImages(res.parsed, feed));
+        return feed;
+      } catch (error) {
+        logDiag('error', 'Error adding feed', error);
+        set({ error: 'Failed to add feed. Please check the URL and try again.' });
+        return null;
       }
+    },
 
-      const parsed = parseFeed(result.text);
-      if (!parsed) {
-        await get().updateFeed(feedId, { errorMessage: 'Failed to parse feed' });
-        return;
+    updateFeed: async (feedId, updates) => {
+      const feed = get().feeds.find(f => f.id === feedId);
+      if (!feed) return;
+      const updatedFeed = { ...feed, ...updates };
+      set(state => ({ feeds: state.feeds.map(f => (f.id === feedId ? updatedFeed : f)) }));
+      try {
+        await saveFeed(updatedFeed);
+      } catch (e) {
+        logDiag('error', 'Saving feed failed', e);
       }
+    },
 
-      // Extract new images with deduplication
-      const rawImages: FeedImage[] = [];
-      for (const item of parsed.items) {
-        for (const imgUrl of item.images) {
-          rawImages.push({
-            id: uuid(),
-            feedId: feed.id,
-            url: imgUrl,
-            sourceUrl: item.link || feed.url,
-            title: item.title,
-            guid: item.guid,
-            pubDate: item.pubDate ? item.pubDate.getTime() : undefined,
-            fetchedAt: Date.now()
-          });
-        }
-      }
-
-      const newImages = dedupeImages(rawImages);
-      const existingImages = get().imagesByFeed[feedId] || [];
-      const mergedImages = mergeImages(existingImages, newImages);
-
-      // Clear and save merged
-      await clearFeedImages(feedId);
-      if (mergedImages.length > 0) {
-        await saveImages(mergedImages);
-      }
-
-      await get().updateFeed(feedId, {
-        lastFetched: Date.now(),
-        errorMessage: undefined
-      });
-
+    removeFeed: async (feedId) => {
       set(state => {
-        const otherImages = state.allImages.filter(img => img.feedId !== feedId);
-        const newAllImages = dedupeImages([...mergedImages, ...otherImages]);
+        const imagesByFeed = { ...state.imagesByFeed };
+        delete imagesByFeed[feedId];
         return {
-          imagesByFeed: { ...state.imagesByFeed, [feedId]: mergedImages },
-          allImages: newAllImages.sort((a, b) => (b.pubDate || b.fetchedAt) - (a.pubDate || a.fetchedAt)),
-          _cachedFilteredByFeed: null,
-          _cachedFilteredAll: null,
-          _cacheKey: ''
+          feeds: state.feeds.filter(f => f.id !== feedId),
+          imagesByFeed,
+          allImages: state.allImages.filter(img => img.feedId !== feedId)
         };
       });
-    } catch (error) {
-      console.error('Error refreshing feed:', error);
-      await get().updateFeed(feedId, { errorMessage: 'Refresh failed' });
-    } finally {
-      set(state => {
-        const newLoading = new Set(state.loadingFeeds);
-        newLoading.delete(feedId);
-        return { loadingFeeds: newLoading };
-      });
-    }
-  },
+      try {
+        await deleteFeedFromDB(feedId);
+      } catch (e) {
+        logDiag('error', 'Deleting feed failed', e);
+      }
+    },
 
-  refreshAllFeeds: async () => {
-    const { feeds } = get();
-    await Promise.all(feeds.map(f => get().refreshFeed(f.id)));
-  },
+    refreshFeed: async (feedId) => {
+      const feed = get().feeds.find(f => f.id === feedId);
+      if (!feed || get().loadingFeeds.has(feedId)) return;
+      set(state => ({ loadingFeeds: new Set([...state.loadingFeeds, feedId]) }));
+      try {
+        const res = await fetchParsed(feed.url);
+        if (!res.ok) {
+          await get().updateFeed(feedId, { errorMessage: res.error });
+          return;
+        }
+        await mergeIntoFeed(feedId, buildFeedImages(res.parsed, feed));
+        await get().updateFeed(feedId, { lastFetched: Date.now(), errorMessage: undefined });
+      } catch (error) {
+        logDiag('warn', `Refresh ${feed.title} failed`, error);
+        await get().updateFeed(feedId, { errorMessage: 'Refresh failed' });
+      } finally {
+        set(state => {
+          const next = new Set(state.loadingFeeds);
+          next.delete(feedId);
+          return { loadingFeeds: next };
+        });
+      }
+    },
 
-  reorderFeed: async (feedId, newIndex) => {
-    const { feeds } = get();
-    const currentIndex = feeds.findIndex(f => f.id === feedId);
-    if (currentIndex === -1 || currentIndex === newIndex) return;
+    refreshAllFeeds: async () => {
+      if (get().refreshProgress) return;
+      const feeds = get().feeds;
+      if (!feeds.length) return;
+      set({ refreshProgress: { done: 0, total: feeds.length }, olderStatus: 'idle' });
+      try {
+        await runLimited(feeds, 3, async f => {
+          await get().refreshFeed(f.id);
+          set(state => ({
+            refreshProgress: state.refreshProgress && { ...state.refreshProgress, done: state.refreshProgress.done + 1 }
+          }));
+        });
+      } finally {
+        set({ refreshProgress: null });
+      }
+    },
 
-    const newFeeds = [...feeds];
-    const [removed] = newFeeds.splice(currentIndex, 1);
-    newFeeds.splice(newIndex, 0, removed);
+    reorderFeed: async (feedId, newIndex) => {
+      const { feeds } = get();
+      const currentIndex = feeds.findIndex(f => f.id === feedId);
+      if (currentIndex === -1 || currentIndex === newIndex) return;
+      const newFeeds = [...feeds];
+      const [removed] = newFeeds.splice(currentIndex, 1);
+      newFeeds.splice(newIndex, 0, removed);
+      for (let i = 0; i < newFeeds.length; i++) {
+        newFeeds[i] = { ...newFeeds[i], order: i };
+      }
+      set({ feeds: newFeeds });
+      for (const f of newFeeds) await saveFeed(f);
+    },
 
-    // Update order for all affected feeds
-    for (let i = 0; i < newFeeds.length; i++) {
-      newFeeds[i] = { ...newFeeds[i], order: i };
-      await saveFeed(newFeeds[i]);
-    }
+    addFolder: async (name) => {
+      const folder: Folder = { id: uuid(), name, order: get().folders.length, collapsed: false };
+      await saveFolder(folder);
+      set(state => ({ folders: [...state.folders, folder] }));
+      return folder;
+    },
 
-    set({ feeds: newFeeds });
-  },
+    updateFolder: async (folderId, updates) => {
+      const folder = get().folders.find(f => f.id === folderId);
+      if (!folder) return;
+      const updatedFolder = { ...folder, ...updates };
+      await saveFolder(updatedFolder);
+      set(state => ({ folders: state.folders.map(f => (f.id === folderId ? updatedFolder : f)) }));
+    },
 
-  addFolder: async (name) => {
-    const { folders } = get();
-    const folder: Folder = {
-      id: uuid(),
-      name,
-      order: folders.length,
-      collapsed: false
-    };
-
-    await saveFolder(folder);
-    set(state => ({ folders: [...state.folders, folder] }));
-    return folder;
-  },
-
-  updateFolder: async (folderId, updates) => {
-    const { folders } = get();
-    const folder = folders.find(f => f.id === folderId);
-    if (!folder) return;
-
-    const updatedFolder = { ...folder, ...updates };
-    await saveFolder(updatedFolder);
-
-    set(state => ({
-      folders: state.folders.map(f => f.id === folderId ? updatedFolder : f)
-    }));
-  },
-
-  removeFolder: async (folderId) => {
-    await deleteFolderFromDB(folderId);
-
-    set(state => ({
-      folders: state.folders.filter(f => f.id !== folderId),
-      feeds: state.feeds.map(f => f.folderId === folderId ? { ...f, folderId: undefined } : f)
-    }));
-  },
-
-  toggleFolderCollapsed: async (folderId) => {
-    const { folders } = get();
-    const folder = folders.find(f => f.id === folderId);
-    if (!folder) return;
-
-    await get().updateFolder(folderId, { collapsed: !folder.collapsed });
-  },
-
-  toggleFavorite: async (image) => {
-    const { favorites } = get();
-    const existing = favorites.find(f => f.imageId === image.id);
-
-    if (existing) {
-      await removeFavorite(image.id);
+    removeFolder: async (folderId) => {
+      await deleteFolderFromDB(folderId);
       set(state => ({
-        favorites: state.favorites.filter(f => f.imageId !== image.id)
+        folders: state.folders.filter(f => f.id !== folderId),
+        feeds: state.feeds.map(f => (f.folderId === folderId ? { ...f, folderId: undefined } : f))
       }));
-    } else {
-      const favorite: FavoriteImage = {
-        imageId: image.id,
-        feedId: image.feedId,
-        url: image.url,
-        thumbnailUrl: image.thumbnailUrl,
-        sourceUrl: image.sourceUrl,
-        title: image.title,
-        savedAt: Date.now()
-      };
-      await addFavorite(favorite);
-      set(state => ({
-        favorites: [favorite, ...state.favorites]
-      }));
-    }
-  },
+    },
 
-  isFavorited: (imageId) => {
-    return get().favorites.some(f => f.imageId === imageId);
-  },
+    toggleFolderCollapsed: async (folderId) => {
+      const folder = get().folders.find(f => f.id === folderId);
+      if (!folder) return;
+      await get().updateFolder(folderId, { collapsed: !folder.collapsed });
+    },
 
-  clearError: () => set({ error: null })
-}));
+    toggleFavorite: async (image) => {
+      const { favoriteIds } = get();
+      if (favoriteIds.has(image.id)) {
+        set(state => {
+          const ids = new Set(state.favoriteIds);
+          ids.delete(image.id);
+          return { favorites: state.favorites.filter(f => f.imageId !== image.id), favoriteIds: ids };
+        });
+        await removeFavorite(image.id);
+      } else {
+        const favorite: FavoriteImage = {
+          imageId: image.id,
+          feedId: image.feedId,
+          url: image.url,
+          thumbnailUrl: image.thumbnailUrl,
+          sourceUrl: image.sourceUrl,
+          title: image.title,
+          savedAt: Date.now()
+        };
+        set(state => ({
+          favorites: [favorite, ...state.favorites],
+          favoriteIds: new Set([...state.favoriteIds, image.id])
+        }));
+        await addFavorite(favorite);
+      }
+    },
+
+    isFavorited: (imageId) => get().favoriteIds.has(imageId),
+
+    clearError: () => set({ error: null })
+  };
+});

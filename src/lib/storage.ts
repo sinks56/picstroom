@@ -1,44 +1,12 @@
 import { openDB, type IDBPDatabase } from 'idb';
-import { canonicalImageKey } from './feed-parser';
+import { dedupeImages } from './collections';
 import type { Feed, FeedImage, Folder, FavoriteImage, Settings } from '../types';
 import { DEFAULT_PROXIES } from './cors-proxy';
 
 const DB_NAME = 'picstroom';
 const DB_VERSION = 2;
 
-export function getDedupeKey(image: FeedImage): string {
-  // Key on the picture itself (size variants collapsed). Keying on guid/post was wrong:
-  // a post has many images, and images stored before guids existed would never match
-  // their re-fetched copies, so every refresh after upgrading would duplicate them.
-  return `img:${canonicalImageKey(image.url)}`;
-}
-
-export function dedupeImages(images: FeedImage[]): FeedImage[] {
-  const seen = new Map<string, FeedImage>();
-  for (const img of images) {
-    const key = getDedupeKey(img);
-    const existing = seen.get(key);
-    if (!existing || (img.pubDate && existing.pubDate && img.pubDate > existing.pubDate)) {
-      seen.set(key, img);
-    }
-  }
-  return Array.from(seen.values());
-}
-
-export function mergeImages(existing: FeedImage[], incoming: FeedImage[]): FeedImage[] {
-  const byKey = new Map<string, FeedImage>();
-  for (const img of existing) {
-    byKey.set(getDedupeKey(img), img);
-  }
-  for (const img of incoming) {
-    const key = getDedupeKey(img);
-    const old = byKey.get(key);
-    if (!old || (img.pubDate && old.pubDate && img.pubDate > old.pubDate)) {
-      byKey.set(key, img);
-    }
-  }
-  return Array.from(byKey.values());
-}
+export { getDedupeKey, dedupeImages, mergeImages } from './collections';
 
 interface PicStroomDB {
   feeds: Feed;
@@ -115,19 +83,22 @@ export async function initDB(): Promise<IDBPDatabase<any>> {
 
 // Settings
 export const DEFAULT_SETTINGS: Settings = {
-  theme: 'system',
+  theme: 'dark',
   viewMode: 'rows',
   imageQuality: 'high',
   minImageWidth: 100,
   minImageHeight: 100,
   proxyList: DEFAULT_PROXIES,
-  timeWindowDays: 14
+  timeWindowDays: 14,
+  optimizeImages: true,
+  maxPerPostInGrid: 6
 };
 
 export async function getSettings(): Promise<Settings> {
   const database = await initDB();
   const settings = await database.get('settings', 'main');
-  return settings || DEFAULT_SETTINGS;
+  // Merge so settings added in newer versions get their defaults.
+  return { ...DEFAULT_SETTINGS, ...(settings || {}) };
 }
 
 export async function saveSettings(settings: Settings): Promise<void> {
@@ -150,12 +121,8 @@ export async function saveFeed(feed: Feed): Promise<void> {
 export async function deleteFeed(feedId: string): Promise<void> {
   const database = await initDB();
   await database.delete('feeds', feedId);
-  
-  // Delete associated images
-  const images = await database.getAllFromIndex('images', 'feedId', feedId);
-  for (const image of images) {
-    await database.delete('images', image.id);
-  }
+  const keys = await database.getAllKeysFromIndex('images', 'feedId', feedId);
+  await deleteImages(keys as string[]);
 }
 
 export async function updateFeedOrder(feedId: string, newOrder: number): Promise<void> {
@@ -168,35 +135,39 @@ export async function updateFeedOrder(feedId: string, newOrder: number): Promise
 }
 
 // Images
-export async function getImagesByFeed(feedId: string): Promise<FeedImage[]> {
-  const database = await initDB();
-  const images = await database.getAllFromIndex('images', 'feedId', feedId);
-  return images.sort((a, b) => b.fetchedAt - a.fetchedAt);
-}
+const WRITE_CHUNK = 300;
+const yieldToMain = () => new Promise<void>(r => setTimeout(r, 0));
 
 export async function getAllImages(): Promise<FeedImage[]> {
   const database = await initDB();
-  const images = await database.getAll('images');
-  return images.sort((a, b) => b.fetchedAt - a.fetchedAt);
+  return database.getAll('images');
 }
 
-export async function saveImages(images: FeedImage[]): Promise<void> {
+/**
+ * Upsert only the given records, in small transactions with a yield between them so a
+ * big page of images never blocks input for long. (Previously every refresh deleted and
+ * rewrote the whole feed, which grew without bound and froze the UI on older phones.)
+ */
+export async function upsertImages(images: FeedImage[]): Promise<void> {
+  if (!images.length) return;
   const database = await initDB();
-  const tx = database.transaction('images', 'readwrite');
-  for (const image of images) {
-    await tx.store.put(image);
+  for (let i = 0; i < images.length; i += WRITE_CHUNK) {
+    const tx = database.transaction('images', 'readwrite');
+    for (const image of images.slice(i, i + WRITE_CHUNK)) tx.store.put(image);
+    await tx.done;
+    if (i + WRITE_CHUNK < images.length) await yieldToMain();
   }
-  await tx.done;
 }
 
-export async function clearFeedImages(feedId: string): Promise<void> {
+export async function deleteImages(ids: string[]): Promise<void> {
+  if (!ids.length) return;
   const database = await initDB();
-  const images = await database.getAllFromIndex('images', 'feedId', feedId);
-  const tx = database.transaction('images', 'readwrite');
-  for (const image of images) {
-    await tx.store.delete(image.id);
+  for (let i = 0; i < ids.length; i += WRITE_CHUNK) {
+    const tx = database.transaction('images', 'readwrite');
+    for (const id of ids.slice(i, i + WRITE_CHUNK)) tx.store.delete(id);
+    await tx.done;
+    if (i + WRITE_CHUNK < ids.length) await yieldToMain();
   }
-  await tx.done;
 }
 
 // Folders

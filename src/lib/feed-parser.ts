@@ -1,4 +1,5 @@
-import type { ParsedFeed, ParsedFeedItem } from '../types';
+import type { ParsedFeed, ParsedFeedItem, ParsedImage } from '../types';
+export type { ParsedImage };
 
 const SKIP_PATTERNS = [
   /feeds\.feedburner\.com/i,
@@ -27,157 +28,219 @@ export function canonicalImageKey(url: string): string {
   return url.replace(/[?#].*$/, '').replace(/-\d+x\d+(?=\.[a-z0-9]+$)/i, '').toLowerCase();
 }
 
-function dedupeByCanonical(urls: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const u of urls) {
-    const key = canonicalImageKey(u);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(u);
-  }
-  return out;
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&#0*38;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0*39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
 }
 
-// Pick one URL per <img>: the largest srcset candidate up to 2048w, else src.
-// (Previously every srcset size was added, so each picture appeared 4-5 times.)
-function bestSourceForImgTag(tag: string): string | null {
-  const srcset = /\ssrcset=["']([^"']+)["']/i.exec(tag)?.[1];
+function absolutize(url: string, base?: string): string | null {
+  const u = decodeEntities(url.trim());
+  if (!u || u.startsWith('data:')) return null;
+  if (u.startsWith('//')) return 'https:' + u;
+  if (/^https?:\/\//i.test(u)) return u;
+  if (!base) return null;
+  try {
+    return new URL(u, base).toString();
+  } catch {
+    return null;
+  }
+}
+
+function attr(tag: string, name: string): string | undefined {
+  const m = new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, 'i').exec(tag);
+  return m ? (m[2] ?? m[3]) : undefined;
+}
+
+function num(v: string | null | undefined): number | undefined {
+  if (!v) return undefined;
+  const n = parseInt(v, 10);
+  return isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** Dimensions encoded in WordPress file names: photo-1024x683.jpg */
+function dimsFromName(url: string): { width: number; height: number } | undefined {
+  const m = /-(\d{2,5})x(\d{2,5})\.[a-z0-9]+(?:[?#].*)?$/i.exec(url);
+  if (!m) return undefined;
+  return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+}
+
+const MIN_DIMENSION = 100;
+
+function isTooSmall(img: ParsedImage): boolean {
+  return (!!img.width && img.width < MIN_DIMENSION) || (!!img.height && img.height < MIN_DIMENSION);
+}
+
+/** Parse one <img> tag into a ParsedImage: one entry per picture, never per srcset size. */
+export function parseImgTag(tag: string, base?: string): ParsedImage | null {
+  const src = attr(tag, 'src') || attr(tag, 'data-src') || attr(tag, 'data-lazy-src');
+  const srcset = attr(tag, 'srcset') || attr(tag, 'data-srcset');
+  let width = num(attr(tag, 'width'));
+  let height = num(attr(tag, 'height'));
+
+  const candidates: { u: string; w: number }[] = [];
   if (srcset) {
-    const candidates = srcset.split(',').map(s => {
-      const [u, d] = s.trim().split(/\s+/);
-      const w = d && /^\d+w$/.test(d) ? parseInt(d) : 0;
-      return { u, w };
-    }).filter(c => c.u && !shouldSkipImage(c.u));
-    if (candidates.length) {
-      const capped = candidates.filter(c => c.w > 0 && c.w <= 2048);
-      const pool = capped.length ? capped : candidates;
-      pool.sort((a, b) => b.w - a.w);
-      return pool[0].u;
+    for (const part of decodeEntities(srcset).split(/,\s+(?=\S)/)) {
+      const [raw, d] = part.trim().split(/\s+/);
+      const u = raw ? absolutize(raw, base) : null;
+      if (!u || shouldSkipImage(u)) continue;
+      const w = d && /^\d+w$/.test(d) ? parseInt(d, 10) : 0;
+      candidates.push({ u, w });
     }
   }
-  const src = /\ssrc=["']([^"']+)["']/i.exec(tag)?.[1];
-  return src && !shouldSkipImage(src) ? src : null;
+  const srcAbs = src ? absolutize(src, base) : null;
+
+  let url: string | null = null;
+  let thumb: string | undefined;
+  if (candidates.length) {
+    const sized = candidates.filter(c => c.w > 0).sort((a, b) => a.w - b.w);
+    if (sized.length) {
+      const capped = sized.filter(c => c.w <= 2048);
+      url = (capped.length ? capped[capped.length - 1] : sized[0]).u;
+      const t = sized.find(c => c.w >= 400) || sized[sized.length - 1];
+      if (t.u !== url) thumb = t.u;
+    } else {
+      url = candidates[0].u;
+    }
+  }
+  if (!url) url = srcAbs;
+  if (!url || shouldSkipImage(url)) return null;
+
+  // Width/height attributes are often the *display* size; only their ratio matters.
+  if (!width || !height) {
+    const d = dimsFromName(url) || (thumb && dimsFromName(thumb)) || (srcAbs && dimsFromName(srcAbs)) ||
+      candidates.map(c => dimsFromName(c.u)).find(Boolean);
+    if (d) {
+      width = d.width;
+      height = d.height;
+    }
+  }
+  const img: ParsedImage = { url, thumb, width, height };
+  if (isTooSmall(img)) return null;
+  return img;
 }
 
-function extractImagesFromHtml(html: string): string[] {
-  const images: string[] = [];
+export function extractImagesFromHtml(html: string, base?: string): ParsedImage[] {
+  const images: ParsedImage[] = [];
   const imgTagRegex = /<img\b[^>]*>/gi;
   let match;
   while ((match = imgTagRegex.exec(html)) !== null) {
-    const best = bestSourceForImgTag(match[0]);
-    if (best) images.push(best);
+    const img = parseImgTag(match[0], base);
+    if (img) images.push(img);
   }
 
-  // Match background-image in style attributes
   const bgRegex = /background-image:\s*url\(["']?([^"')]+)["']?\)/gi;
   while ((match = bgRegex.exec(html)) !== null) {
-    const src = match[1];
-    if (src && !shouldSkipImage(src)) {
-      images.push(src);
-    }
+    const u = absolutize(match[1], base);
+    if (u && !shouldSkipImage(u)) images.push({ url: u, ...dimsFromName(u) });
   }
 
-  return dedupeByCanonical(images);
+  return dedupeParsed(images);
 }
 
-function extractImagesFromItem(item: Element, _namespaces: Record<string, string>): string[] {
-  const images: string[] = [];
+/** Merge entries for the same picture, keeping the first URL but filling missing metadata. */
+export function dedupeParsed(images: ParsedImage[]): ParsedImage[] {
+  const byKey = new Map<string, ParsedImage>();
+  for (const img of images) {
+    const key = canonicalImageKey(img.url);
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, { ...img });
+      continue;
+    }
+    if (!prev.thumb && img.thumb) prev.thumb = img.thumb;
+    if ((!prev.width || !prev.height) && img.width && img.height) {
+      prev.width = img.width;
+      prev.height = img.height;
+    }
+  }
+  return [...byKey.values()];
+}
 
-  // media:content
-  const mediaContents = item.querySelectorAll('content');
-  for (const mc of mediaContents) {
-    const url = mc.getAttribute('url');
+function mediaImage(el: Element, base?: string): ParsedImage | null {
+  const raw = el.getAttribute('url') || el.getAttribute('href');
+  const u = raw ? absolutize(raw, base) : null;
+  if (!u || shouldSkipImage(u)) return null;
+  const width = num(el.getAttribute('width'));
+  const height = num(el.getAttribute('height'));
+  const img: ParsedImage = { url: u, width, height };
+  if (!width || !height) Object.assign(img, dimsFromName(u));
+  return isTooSmall(img) ? null : img;
+}
+
+/**
+ * Descendants by local name, so prefixed elements (content:encoded, media:content) match
+ * regardless of namespace handling in the engine's selector implementation.
+ */
+function byLocalName(root: Element, name: string): Element[] {
+  const out: Element[] = [];
+  for (const el of root.getElementsByTagName('*')) if (el.localName === name) out.push(el);
+  return out;
+}
+
+function extractImagesFromItem(item: Element, base?: string): ParsedImage[] {
+  const images: ParsedImage[] = [];
+
+  // Inline content first: it carries srcset (thumbnails) and the article's real order.
+  for (const sel of ['encoded', 'description', 'summary']) {
+    const el = byLocalName(item, sel)[0];
+    if (el?.textContent) images.push(...extractImagesFromHtml(el.textContent, base));
+  }
+  for (const c of byLocalName(item, 'content')) {
+    // Atom <content type="html"> holds HTML; media:content holds a url attribute.
+    if (c.getAttribute('url')) continue;
+    const type = c.getAttribute('type') || '';
+    if ((type === 'html' || type === 'xhtml' || !type) && c.textContent) {
+      images.push(...extractImagesFromHtml(c.textContent, base));
+    }
+  }
+
+  // media:content / media:group / media:thumbnail
+  for (const mc of byLocalName(item, 'content')) {
+    if (!mc.getAttribute('url')) continue;
     const type = mc.getAttribute('type') || '';
     const medium = mc.getAttribute('medium') || '';
-    if (url && (type.startsWith('image/') || medium === 'image' || !type)) {
-      if (!shouldSkipImage(url)) images.push(url);
+    if (type.startsWith('image/') || medium === 'image' || (!type && !medium)) {
+      const img = mediaImage(mc, base);
+      if (img) images.push(img);
     }
   }
-
-  // media:thumbnail
-  const mediaThumbnails = item.querySelectorAll('thumbnail');
-  for (const mt of mediaThumbnails) {
-    const url = mt.getAttribute('url');
-    if (url && !shouldSkipImage(url)) images.push(url);
+  for (const mt of byLocalName(item, 'thumbnail')) {
+    const img = mediaImage(mt, base);
+    if (img) images.push(img);
   }
 
-  // media:group > media:content
-  const mediaGroups = item.querySelectorAll('group');
-  for (const mg of mediaGroups) {
-    const contents = mg.querySelectorAll('content');
-    for (const mc of contents) {
-      const url = mc.getAttribute('url');
-      const type = mc.getAttribute('type') || '';
-      if (url && (type.startsWith('image/') || !type)) {
-        if (!shouldSkipImage(url)) images.push(url);
-      }
-    }
-  }
-
-  // enclosure
-  const enclosures = item.querySelectorAll('enclosure');
-  for (const enc of enclosures) {
-    const url = enc.getAttribute('url');
-    const type = enc.getAttribute('type') || '';
-    if (url && type.startsWith('image/')) {
-      if (!shouldSkipImage(url)) images.push(url);
+  for (const enc of byLocalName(item, 'enclosure')) {
+    if ((enc.getAttribute('type') || '').startsWith('image/')) {
+      const img = mediaImage(enc, base);
+      if (img) images.push(img);
     }
   }
 
   // itunes:image
-  const itunesImages = item.querySelectorAll('image');
-  for (const img of itunesImages) {
-    const href = img.getAttribute('href');
-    if (href && !shouldSkipImage(href)) images.push(href);
-  }
-
-  // description HTML
-  const description = item.querySelector('description');
-  if (description?.textContent) {
-    const htmlImages = extractImagesFromHtml(description.textContent);
-    images.push(...htmlImages);
-  }
-
-  // content:encoded HTML
-  const contentEncoded = item.querySelector('encoded');
-  if (contentEncoded?.textContent) {
-    const htmlImages = extractImagesFromHtml(contentEncoded.textContent);
-    images.push(...htmlImages);
-  }
-
-  // Atom content
-  const atomContent = item.querySelector('content');
-  if (atomContent?.textContent) {
-    const type = atomContent.getAttribute('type') || '';
-    if (type === 'html' || type === 'xhtml' || !type) {
-      const htmlImages = extractImagesFromHtml(atomContent.textContent);
-      images.push(...htmlImages);
+  for (const im of byLocalName(item, 'image')) {
+    if (im.getAttribute('href')) {
+      const img = mediaImage(im, base);
+      if (img) images.push(img);
     }
   }
 
-  // summary (Atom)
-  const summary = item.querySelector('summary');
-  if (summary?.textContent) {
-    const type = summary.getAttribute('type') || '';
-    if (type === 'html' || type === 'xhtml' || !type) {
-      const htmlImages = extractImagesFromHtml(summary.textContent);
-      images.push(...htmlImages);
-    }
-  }
-
-  // Direct image links
-  const links = item.querySelectorAll('link');
-  for (const link of links) {
-    const href = link.getAttribute('href') || link.textContent || '';
+  // Direct image links (Atom enclosures etc.)
+  for (const link of byLocalName(item, 'link')) {
+    const href = link.getAttribute('href') || '';
     const type = link.getAttribute('type') || '';
     const rel = link.getAttribute('rel') || '';
-    if (href && (type.startsWith('image/') || rel === 'enclosure' || /\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(href))) {
-      if (!shouldSkipImage(href)) images.push(href);
+    if (href && (type.startsWith('image/') || (rel === 'enclosure' && type.startsWith('image/')) || /\.(jpe?g|png|webp|avif)(\?|$)/i.test(href))) {
+      const img = mediaImage(link, base);
+      if (img) images.push(img);
     }
   }
 
-  return dedupeByCanonical(images);
+  return dedupeParsed(images);
 }
 
 function getTextContent(element: Element | null): string {
@@ -207,14 +270,6 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
       return null;
     }
 
-    const namespaces: Record<string, string> = {};
-    const root = doc.documentElement;
-    for (const attr of root.attributes) {
-      if (attr.name.startsWith('xmlns:')) {
-        namespaces[attr.name.substring(6)] = attr.value;
-      }
-    }
-
     // RSS 2.0
     const channel = doc.querySelector('channel');
     if (channel) {
@@ -230,7 +285,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
         const itemLink = getTextContent(item.querySelector('link'));
         const itemGuid = getTextContent(item.querySelector('guid'));
         const pubDateStr = getTextContent(item.querySelector('pubDate'));
-        const images = extractImagesFromItem(item, namespaces);
+        const images = extractImagesFromItem(item, itemLink || link || undefined);
         
         if (images.length > 0) {
           items.push({
@@ -263,7 +318,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
         const entryId = getTextContent(entry.querySelector('id'));
         const publishedStr = getTextContent(entry.querySelector('published')) || 
                            getTextContent(entry.querySelector('updated'));
-        const images = extractImagesFromItem(entry, namespaces);
+        const images = extractImagesFromItem(entry, entryLink || siteUrl || undefined);
 
         if (images.length > 0) {
           items.push({
@@ -280,7 +335,7 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
     }
 
     // RDF (RSS 1.0)
-    const rdf = doc.querySelector('RDF');
+    const rdf = doc.documentElement?.localName === 'RDF' ? doc.documentElement : null;
     if (rdf) {
       const channelEl = rdf.querySelector('channel');
       const title = getTextContent(channelEl?.querySelector('title') || null);
@@ -294,8 +349,8 @@ export function parseFeed(xmlText: string): ParsedFeed | null {
         const itemTitle = getTextContent(item.querySelector('title'));
         const itemLink = getTextContent(item.querySelector('link'));
         const itemAbout = item.getAttribute('rdf:about');
-        const dateStr = getTextContent(item.querySelector('date'));
-        const images = extractImagesFromItem(item, namespaces);
+        const dateStr = getTextContent(byLocalName(item, 'date')[0] || null);
+        const images = extractImagesFromItem(item, itemLink || link || undefined);
 
         if (images.length > 0) {
           items.push({

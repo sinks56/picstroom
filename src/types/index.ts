@@ -24,7 +24,12 @@ export interface Feed {
   lastFetched?: number;
   errorMessage?: string;
   lastFetchedPage?: number;
+  /** Set when a page parsed fine but contained nothing new (true end of the archive). */
   noMorePages?: boolean;
+  noMorePagesAt?: number;
+  /** Consecutive failures fetching the next page; drives exponential backoff. */
+  pageFailures?: number;
+  nextPageRetryAt?: number;
 }
 
 export interface Folder {
@@ -59,6 +64,10 @@ export interface Settings {
   customProxyUrl?: string;
   proxyList: ProxyConfig[];
   timeWindowDays: number;
+  /** Serve grid/row thumbnails and viewer images through a resizing image proxy. */
+  optimizeImages?: boolean;
+  /** Max images from one post in the combined grid (0 = unlimited). */
+  maxPerPostInGrid?: number;
 }
 
 export interface StarterFeed {
@@ -68,11 +77,18 @@ export interface StarterFeed {
   description: string;
 }
 
+export interface ParsedImage {
+  url: string;
+  thumb?: string;
+  width?: number;
+  height?: number;
+}
+
 export interface ParsedFeedItem {
   title?: string;
   link?: string;
   guid?: string;
-  images: string[];
+  images: ParsedImage[];
   pubDate?: Date;
 }
 

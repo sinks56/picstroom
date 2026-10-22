@@ -1,28 +1,31 @@
 import { defineConfig, devices } from '@playwright/test';
 
+// E2E runs against the production build (vite preview) in a mobile Chrome profile.
+// The relay (picstroom-proxy.pages.dev) allows http://localhost:<port> origins.
+const PORT = 5847;
+
 export default defineConfig({
-  testDir: './tests',
-  fullyParallel: true,
-  forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
-  reporter: 'html',
+  testDir: './tests/e2e',
+  timeout: 180_000,
+  expect: { timeout: 20_000 },
+  fullyParallel: false,
+  workers: 1,
+  retries: process.env.CI ? 1 : 0,
+  reporter: [['list']],
   use: {
-    baseURL: 'http://localhost:5173/picstroom/',
-    trace: 'on-first-retry',
+    baseURL: `http://localhost:${PORT}/picstroom/`,
+    trace: 'retain-on-failure',
+    colorScheme: 'dark',
+    // Set PW_CHANNEL=chrome to use the system Chrome instead of Playwright's Chromium.
+    ...(process.env.PW_CHANNEL ? { channel: process.env.PW_CHANNEL } : {})
   },
   projects: [
-    {
-      name: 'Mobile Chrome',
-      use: { 
-        ...devices['Pixel 5'],
-      },
-    },
+    { name: 'mobile-chrome', use: { ...devices['Pixel 7'] } }
   ],
   webServer: {
-    command: 'npm run dev -- --port 5173 --host',
-    url: 'http://localhost:5173/picstroom/',
+    command: `npx vite preview --port ${PORT} --strictPort`,
+    url: `http://localhost:${PORT}/picstroom/`,
     reuseExistingServer: true,
-    timeout: 120 * 1000,
-  },
+    timeout: 60_000
+  }
 });

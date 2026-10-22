@@ -16,9 +16,13 @@ const config: CapacitorConfig = {
       launchShowDuration: 0,
       backgroundColor: '#000000'
     },
-    StatusBar: {
-      style: 'dark',
-      backgroundColor: '#000000'
+    // Capacitor 8 core plugin. 'css' injects --safe-area-inset-* (real values when the
+    // WebView draws edge-to-edge, 0 when Capacitor pads the WebView natively on WebView < 140),
+    // which index.css consumes with an env() fallback for browsers / the iPad PWA.
+    SystemBars: {
+      insetsHandling: 'css',
+      style: 'DARK',
+      initialViewportFitValueHint: 'cover'
     }
   }
 };

@@ -70,7 +70,7 @@ export function DiscoverModal({ isOpen, onClose }: DiscoverModalProps) {
             onClick={() => setSelectedCategory(null)}
             className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
               selectedCategory === null
-                ? 'bg-[var(--color-accent)] text-white'
+                ? 'bg-[var(--color-accent)] text-[var(--color-accent-fg)]'
                 : 'bg-[var(--color-bg-tertiary)] hover:bg-[var(--color-bg-secondary)]'
             }`}
           >
@@ -82,7 +82,7 @@ export function DiscoverModal({ isOpen, onClose }: DiscoverModalProps) {
               onClick={() => setSelectedCategory(category)}
               className={`px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
                 selectedCategory === category
-                  ? 'bg-[var(--color-accent)] text-white'
+                  ? 'bg-[var(--color-accent)] text-[var(--color-accent-fg)]'
                   : 'bg-[var(--color-bg-tertiary)] hover:bg-[var(--color-bg-secondary)]'
               }`}
             >
@@ -111,6 +111,7 @@ export function DiscoverModal({ isOpen, onClose }: DiscoverModalProps) {
             return (
               <div
                 key={feed.url}
+                data-testid={`discover-${feed.title}`}
                 className="flex items-center gap-3 p-3 rounded-lg bg-[var(--color-bg-secondary)]"
               >
                 <div className="flex-1 min-w-0">
@@ -131,7 +132,7 @@ export function DiscoverModal({ isOpen, onClose }: DiscoverModalProps) {
                       ? 'bg-green-500/10 text-green-500'
                       : isAdding
                       ? 'bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]'
-                      : 'bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)]'
+                      : 'bg-[var(--color-accent)] text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)]'
                   }`}
                 >
                   {isAdded ? (

@@ -30,3 +30,5 @@ android/local.properties
 *.njsproj
 *.sln
 *.sw?
+test-results/
+playwright-report/

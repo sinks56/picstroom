@@ -1,4 +1,5 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useSyncExternalStore } from 'react';
+import { getDiagnostics, subscribeDiagnostics, clearDiagnostics, diagnosticsReport } from '../lib/diagnostics';
 import { Modal } from './Modal';
 import { useStore } from '../store';
 import { exportToOPML, parseOPML } from '../lib/storage';
@@ -149,25 +150,32 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
             </div>
 
             <div>
-              <h3 className="text-sm font-medium mb-3">Image Quality</h3>
-              <div className="grid grid-cols-3 gap-3">
-                {(['low', 'medium', 'high'] as const).map((quality) => (
-                  <button
-                    key={quality}
-                    onClick={() => updateSettings({ imageQuality: quality })}
-                    className={`p-3 rounded-xl border-2 transition-all ${
-                      settings.imageQuality === quality
-                        ? 'border-[var(--color-accent)] bg-[var(--color-accent)]/10'
-                        : 'border-[var(--color-border)] hover:border-[var(--color-accent)]/50'
-                    }`}
-                  >
-                    <span className="text-sm capitalize">{quality}</span>
-                  </button>
-                ))}
-              </div>
-              <p className="mt-2 text-xs text-[var(--color-text-muted)]">
-                Higher quality uses more data but looks better on retina displays.
-              </p>
+              <h3 className="text-sm font-medium mb-2">Images</h3>
+              <label className="flex items-center justify-between py-2 border-b border-[var(--color-border)] text-sm">
+                <span>
+                  Optimized thumbnails
+                  <span className="block text-xs text-[var(--color-text-muted)]">Resized via wsrv.nl. Much less memory and data; turn off to load originals.</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={settings.optimizeImages !== false}
+                  onChange={e => updateSettings({ optimizeImages: e.target.checked })}
+                  className="w-5 h-5"
+                />
+              </label>
+              <label className="flex items-center justify-between py-2 text-sm">
+                <span>
+                  Max images per post in grid
+                  <span className="block text-xs text-[var(--color-text-muted)]">Stops one article flooding the grid. 0 = no limit.</span>
+                </span>
+                <select
+                  value={settings.maxPerPostInGrid ?? 6}
+                  onChange={e => updateSettings({ maxPerPostInGrid: Number(e.target.value) })}
+                  className="px-2 py-1 bg-[var(--color-bg-secondary)] border border-[var(--color-border)]"
+                >
+                  {[3, 6, 10, 20, 0].map(n => <option key={n} value={n}>{n === 0 ? 'No limit' : n}</option>)}
+                </select>
+              </label>
             </div>
           </div>
         )}
@@ -293,14 +301,51 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
               </button>
             </div>
 
+            <Diagnostics />
+
             <div className="pt-4 border-t border-[var(--color-border)]">
               <p className="text-xs text-[var(--color-text-muted)] text-center">
-                PicStroom v1.0 • All data stored locally on your device
+                PicStroom v{__APP_VERSION__} • All data stored locally on your device
               </p>
             </div>
           </div>
         )}
       </div>
     </Modal>
+  );
+}
+
+function Diagnostics() {
+  const entries = useSyncExternalStore(subscribeDiagnostics, getDiagnostics);
+  const [copied, setCopied] = useState(false);
+  const errors = entries.filter(e => e.level === 'error').length;
+  const copy = async () => {
+    const text = diagnosticsReport();
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      window.prompt('Copy diagnostics', text);
+    }
+  };
+  return (
+    <div data-testid="diagnostics">
+      <h3 className="text-sm font-medium mb-2">Diagnostics</h3>
+      <p className="text-xs text-[var(--color-text-muted)] mb-2">
+        {entries.length} entries, {errors} errors. Copy and send this if something breaks.
+      </p>
+      <div className="max-h-40 overflow-y-auto text-[11px] font-mono bg-[var(--color-bg-secondary)] border border-[var(--color-border)] p-2 mb-2">
+        {entries.length === 0 ? 'No entries' : entries.slice(-30).reverse().map((e, i) => (
+          <div key={i} className={e.level === 'error' ? 'text-red-400' : ''}>
+            {new Date(e.t).toLocaleTimeString()} {e.msg}
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-2">
+        <button onClick={copy} className="flex-1 px-3 py-2 border border-[var(--color-border)] text-sm">{copied ? 'Copied' : 'Copy diagnostics'}</button>
+        <button onClick={clearDiagnostics} className="px-3 py-2 border border-[var(--color-border)] text-sm">Clear</button>
+      </div>
+    </div>
   );
 }

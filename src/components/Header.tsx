@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
 
 interface HeaderProps {
@@ -7,105 +8,103 @@ interface HeaderProps {
   onOpenDiscover: () => void;
 }
 
+const Icon = ({ d, className }: { d: string; className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} className={className} aria-hidden="true">
+    <path strokeLinecap="square" strokeLinejoin="miter" d={d} />
+  </svg>
+);
+
+const ICONS = {
+  rows: 'M3 5h18M3 12h18M3 19h18',
+  grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
+  refresh: 'M16.02 9.35h4.99V4.36M2.99 19.64v-4.99h4.99m-4.99 0 3.18 3.18a8.25 8.25 0 0 0 13.8-3.7M4.03 9.87a8.25 8.25 0 0 1 13.8-3.7l3.18 3.18',
+  discover: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Zm3.5-12.5-2 5-5 2 2-5 5-2Z',
+  star: 'M12 3.5l2.6 5.6 6.1.6-4.6 4.1 1.3 6-5.4-3.1-5.4 3.1 1.3-6-4.6-4.1 6.1-.6z',
+  add: 'M12 5v14M5 12h14',
+  settings: 'M10.3 3h3.4l.5 2.4 1.7 1 2.3-.8 1.7 3-1.8 1.6v2l1.8 1.6-1.7 3-2.3-.8-1.7 1-.5 2.4h-3.4l-.5-2.4-1.7-1-2.3.8-1.7-3 1.8-1.6v-2L3.8 8.6l1.7-3 2.3.8 1.7-1zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z'
+};
+
+/**
+ * Thin, true-black top bar. It sits below the status bar (safe-area inset), hides while
+ * scrolling down and comes back on any upward scroll. A 1px line shows refresh progress.
+ */
 export function Header({ onAddFeed, onOpenSettings, onOpenFavorites, onOpenDiscover }: HeaderProps) {
-  const { settings, updateSettings, refreshAllFeeds, loadingFeeds } = useStore();
-  const isLoading = loadingFeeds.size > 0;
+  const viewMode = useStore(s => s.settings.viewMode);
+  const updateSettings = useStore(s => s.updateSettings);
+  const refreshAllFeeds = useStore(s => s.refreshAllFeeds);
+  const progress = useStore(s => s.refreshProgress);
+  const busy = useStore(s => s.loadingFeeds.size > 0);
+  const [hidden, setHidden] = useState(false);
+  const lastY = useRef(window.scrollY);
+
+  useEffect(() => {
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (document.documentElement.classList.contains('scroll-locked')) return;
+        const y = window.scrollY;
+        const dy = y - lastY.current;
+        if (y < 80) setHidden(false);
+        else if (dy > 12) setHidden(true);
+        else if (dy < -12) setHidden(false);
+        if (Math.abs(dy) > 12 || y < 80) lastY.current = y;
+      });
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      window.removeEventListener('scroll', onScroll);
+    };
+  }, []);
+
+  const pct = progress ? Math.max(4, Math.round((progress.done / progress.total) * 100)) : 0;
 
   return (
-    <header className="sticky top-0 z-40 glass border-b border-[var(--color-border)] bg-[var(--color-bg-primary)]/90">
-      <div className="flex items-center justify-between px-3 py-2 max-w-screen-2xl mx-auto">
-        <h1 className="text-base font-semibold tracking-tight">PicStroom</h1>
-
-        <div className="flex items-center gap-0.5">
-          {/* View Toggle */}
-          <div className="flex items-center bg-[var(--color-bg-tertiary)] rounded p-0.5 mr-1">
-            <button
-              onClick={() => updateSettings({ viewMode: 'rows' })}
-              className={`p-1.5 rounded transition-colors ${
-                settings.viewMode === 'rows'
-                  ? 'bg-[var(--color-bg-primary)] shadow-sm'
-                  : ''
-              }`}
-              aria-label="Row view"
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
-              </svg>
+    <>
+      <div className="ps-statusbar-shield" aria-hidden="true" />
+      <header className={hidden ? 'ps-header ps-header-hidden' : 'ps-header'} data-testid="header">
+        <div className="ps-header-row">
+          <h1 className="ps-brand">PicStroom</h1>
+          <nav className="ps-header-actions">
+            <div className="ps-seg" role="group" aria-label="View">
+              <button
+                className={viewMode === 'rows' ? 'ps-icon-btn ps-on' : 'ps-icon-btn'}
+                onClick={() => updateSettings({ viewMode: 'rows' })}
+                aria-label="Row view"
+                aria-pressed={viewMode === 'rows'}
+              >
+                <Icon d={ICONS.rows} />
+              </button>
+              <button
+                className={viewMode === 'grid' ? 'ps-icon-btn ps-on' : 'ps-icon-btn'}
+                onClick={() => updateSettings({ viewMode: 'grid' })}
+                aria-label="Grid view"
+                aria-pressed={viewMode === 'grid'}
+              >
+                <Icon d={ICONS.grid} />
+              </button>
+            </div>
+            <button className="ps-icon-btn" onClick={() => refreshAllFeeds()} disabled={!!progress} aria-label="Refresh all feeds">
+              <Icon d={ICONS.refresh} className={progress || busy ? 'animate-spin' : ''} />
             </button>
-            <button
-              onClick={() => updateSettings({ viewMode: 'grid' })}
-              className={`p-1.5 rounded transition-colors ${
-                settings.viewMode === 'grid'
-                  ? 'bg-[var(--color-bg-primary)] shadow-sm'
-                  : ''
-              }`}
-              aria-label="Grid view"
-            >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
-              </svg>
+            <button className="ps-icon-btn" onClick={onOpenDiscover} aria-label="Discover feeds">
+              <Icon d={ICONS.discover} />
             </button>
-          </div>
-
-          <button
-            onClick={refreshAllFeeds}
-            disabled={isLoading}
-            className="p-1.5 rounded hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50"
-            aria-label="Refresh all feeds"
-          >
-            <svg 
-              className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} 
-              fill="none" 
-              viewBox="0 0 24 24" 
-              stroke="currentColor" 
-              strokeWidth={1.5}
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
-            </svg>
-          </button>
-
-          <button
-            onClick={onOpenDiscover}
-            className="p-1.5 rounded hover:bg-[var(--color-bg-tertiary)] transition-colors"
-            aria-label="Discover feeds"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418" />
-            </svg>
-          </button>
-
-          <button
-            onClick={onOpenFavorites}
-            className="p-1.5 rounded hover:bg-[var(--color-bg-tertiary)] transition-colors"
-            aria-label="Favorites"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M11.48 3.499a.562.562 0 011.04 0l2.125 5.111a.563.563 0 00.475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 00-.182.557l1.285 5.385a.562.562 0 01-.84.61l-4.725-2.885a.563.563 0 00-.586 0L6.982 20.54a.562.562 0 01-.84-.61l1.285-5.386a.562.562 0 00-.182-.557l-4.204-3.602a.563.563 0 01.321-.988l5.518-.442a.563.563 0 00.475-.345L11.48 3.5z" />
-            </svg>
-          </button>
-
-          <button
-            onClick={onAddFeed}
-            className="p-1.5 rounded hover:bg-[var(--color-bg-tertiary)] transition-colors"
-            aria-label="Add feed"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-            </svg>
-          </button>
-
-          <button
-            onClick={onOpenSettings}
-            className="p-1.5 rounded hover:bg-[var(--color-bg-tertiary)] transition-colors"
-            aria-label="Settings"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z" />
-              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-          </button>
+            <button className="ps-icon-btn" onClick={onOpenFavorites} aria-label="Favorites">
+              <Icon d={ICONS.star} />
+            </button>
+            <button className="ps-icon-btn" onClick={onAddFeed} aria-label="Add feed">
+              <Icon d={ICONS.add} />
+            </button>
+            <button className="ps-icon-btn" onClick={onOpenSettings} aria-label="Settings">
+              <Icon d={ICONS.settings} />
+            </button>
+          </nav>
         </div>
-      </div>
-    </header>
+        <div className="ps-progress" style={{ width: progress ? `${pct}%` : 0, opacity: progress ? 1 : 0 }} />
+      </header>
+    </>
   );
 }

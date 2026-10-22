@@ -1,5 +1,6 @@
 import { Modal } from './Modal';
 import { useStore } from '../store';
+import { cellSources, corsFor } from '../lib/thumbs';
 import type { FeedImage } from '../types';
 
 interface FavoritesModalProps {
@@ -10,6 +11,7 @@ interface FavoritesModalProps {
 
 export function FavoritesModal({ isOpen, onClose, onImageClick }: FavoritesModalProps) {
   const { favorites, toggleFavorite } = useStore();
+  const useProxy = useStore(s => s.settings.optimizeImages !== false);
 
   const handleImageClick = (favorite: typeof favorites[0], index: number) => {
     const image: FeedImage = {
@@ -66,7 +68,7 @@ export function FavoritesModal({ isOpen, onClose, onImageClick }: FavoritesModal
             </p>
           </div>
         ) : (
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          <div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-0">
             {favorites.map((favorite, index) => (
               <div
                 key={favorite.imageId}
@@ -74,16 +76,18 @@ export function FavoritesModal({ isOpen, onClose, onImageClick }: FavoritesModal
                 className="relative aspect-square rounded-xl overflow-hidden cursor-pointer group bg-[var(--color-bg-tertiary)]"
               >
                 <img
-                  src={favorite.thumbnailUrl || favorite.url}
+                  src={cellSources(favorite, 360, useProxy)[0]}
+                  crossOrigin={corsFor(cellSources(favorite, 360, useProxy)[0])}
+                  decoding="async"
                   alt={favorite.title || 'Favorite'}
                   loading="lazy"
-                  className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
+                  className="w-full h-full object-cover "
                 />
                 
                 {/* Remove button */}
                 <button
                   onClick={(e) => handleRemove(favorite.imageId, e)}
-                  className="absolute top-2 right-2 p-1.5 rounded-full bg-black/50 text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-black/70"
+                  className="absolute top-2 right-2 p-1.5 rounded-full bg-black/50 text-white opacity-80 hover:bg-black/70"
                   aria-label="Remove from favorites"
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

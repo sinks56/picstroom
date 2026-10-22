@@ -2,14 +2,24 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
+import { readFileSync } from 'node:fs'
+
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+// Android (Capacitor) serves dist/ from the WebView root, so it needs base '/'.
+const CAP_BUILD = !!process.env.CAP_BUILD
 
 export default defineConfig({
-  // Android (Capacitor) serves dist/ from the WebView root, so it needs base '/'.
-  base: process.env.CAP_BUILD ? '/' : '/picstroom/',
+  base: CAP_BUILD ? '/' : '/picstroom/',
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+    __CAP_BUILD__: JSON.stringify(CAP_BUILD)
+  },
   plugins: [
     react(),
     tailwindcss(),
     VitePWA({
+      // The APK bundles its assets; a service worker there only risks serving stale files.
+      disable: CAP_BUILD,
       registerType: 'autoUpdate',
       includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'icons/*.png'],
       manifest: {
@@ -23,59 +33,43 @@ export default defineConfig({
         start_url: '/picstroom/',
         scope: '/picstroom/',
         icons: [
-          {
-            src: '/picstroom/icons/icon-192.png',
-            sizes: '192x192',
-            type: 'image/png'
-          },
-          {
-            src: '/picstroom/icons/icon-512.png',
-            sizes: '512x512',
-            type: 'image/png'
-          },
-          {
-            src: '/picstroom/icons/icon-512.png',
-            sizes: '512x512',
-            type: 'image/png',
-            purpose: 'maskable'
-          }
+          { src: '/picstroom/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
+          { src: '/picstroom/icons/icon-512.png', sizes: '512x512', type: 'image/png' },
+          { src: '/picstroom/icons/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' }
         ]
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         navigateFallback: '/picstroom/index.html',
         navigateFallbackAllowlist: [/^\/picstroom/],
+        cleanupOutdatedCaches: true,
+        clientsClaim: true,
+        skipWaiting: true,
         runtimeCaching: [
           {
-            urlPattern: /^https:\/\/.*\.(png|jpg|jpeg|gif|webp|svg)$/i,
+            // Resized thumbnails (CORS, small WebP): bounded LRU cache so the grid works offline.
+            urlPattern: /^https:\/\/wsrv\.nl\/\?/i,
             handler: 'CacheFirst',
             options: {
-              cacheName: 'images-cache',
+              cacheName: 'thumbs-v1',
               expiration: {
-                maxEntries: 500,
+                maxEntries: 1500,
                 maxAgeSeconds: 60 * 60 * 24 * 30,
                 purgeOnQuotaError: true
               },
-              // Only cache CORS (200) responses. Cross-origin <img> loads are opaque (status 0),
-              // and browsers count each opaque entry as ~7 MB of quota, so caching them
-              // filled storage after ~120 images and broke IndexedDB writes (QuotaExceededError).
-              cacheableResponse: {
-                statuses: [200]
-              }
+              // Only cache real (CORS) responses. Opaque responses (status 0) are counted as
+              // ~7 MB each by browsers and previously exhausted the storage quota.
+              cacheableResponse: { statuses: [200] }
             }
           },
           {
-            urlPattern: /^https:\/\/.*\/feed|rss|atom/i,
+            urlPattern: /^https:\/\/picstroom-proxy\.pages\.dev\/\?/i,
             handler: 'NetworkFirst',
             options: {
               cacheName: 'feeds-cache',
-              expiration: {
-                maxEntries: 50,
-                maxAgeSeconds: 60 * 60
-              },
-              cacheableResponse: {
-                statuses: [0, 200]
-              }
+              networkTimeoutSeconds: 12,
+              expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 7, purgeOnQuotaError: true },
+              cacheableResponse: { statuses: [200] }
             }
           }
         ]

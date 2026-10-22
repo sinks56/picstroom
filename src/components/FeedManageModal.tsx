@@ -160,7 +160,7 @@ export function FeedManageModal({ feed, isOpen, onClose }: FeedManageModalProps)
           </button>
           <button
             onClick={handleSave}
-            className="flex-1 px-4 py-3 rounded-xl bg-[var(--color-accent)] text-white hover:bg-[var(--color-accent-hover)] transition-colors font-medium"
+            className="flex-1 px-4 py-3 rounded-xl bg-[var(--color-accent)] text-[var(--color-accent-fg)] hover:bg-[var(--color-accent-hover)] transition-colors font-medium"
           >
             Save Changes
           </button>

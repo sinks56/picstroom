@@ -1,265 +1,159 @@
-import { useRef, useState, useEffect, useCallback, useMemo } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Feed, FeedImage } from '../types';
 import { useStore } from '../store';
+import { aspectOf } from '../lib/thumbs';
+import { Thumb } from './Thumb';
 
 interface FeedRowProps {
   feed: Feed;
   images: FeedImage[];
   onImageClick: (image: FeedImage, allImages: FeedImage[], index: number, feedId?: string) => void;
-  onManageFeed: () => void;
+  onManageFeed: (feed: Feed) => void;
+  /** Called when the row is scrolled to its last cells (load older posts). */
+  onNearEnd?: () => void;
 }
 
-const ROW_HEIGHT = 140;
-const VIRTUALIZATION_BUFFER = 400;
+export const ROW_HEIGHT = 140;
+const MAX_ROW_CELLS = 24;
 
-export function FeedRow({ feed, images, onImageClick, onManageFeed }: FeedRowProps) {
+/** Fixed-height row layout from stored aspect ratios: widths never change after load. */
+export function layoutRow(images: FeedImage[], rowHeight = ROW_HEIGHT) {
+  let x = 0;
+  const cells = images.map((image, index) => {
+    const w = Math.round(rowHeight * aspectOf(image, 1, 0.6, 1.8));
+    const cell = { image, index, x, w };
+    x += w;
+    return cell;
+  });
+  return { cells, width: x };
+}
+
+export const FeedRow = memo(function FeedRow({ feed, images, onImageClick, onManageFeed, onNearEnd }: FeedRowProps) {
+  const rowRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const { refreshFeed, loadingFeeds } = useStore();
-  const isLoading = loadingFeeds.has(feed.id);
+  const refreshFeed = useStore(s => s.refreshFeed);
+  const isLoading = useStore(s => s.loadingFeeds.has(feed.id));
+  const useProxy = useStore(s => s.settings.optimizeImages !== false);
+  const [near, setNear] = useState(false);
   const [scrollLeft, setScrollLeft] = useState(0);
-  const [containerWidth, setContainerWidth] = useState(0);
-  const [imageWidths, setImageWidths] = useState<Map<string, number>>(new Map());
-  const [failedImages, setFailedImages] = useState<Set<string>>(new Set());
+  const [viewW, setViewW] = useState(() => window.innerWidth);
+  const [failed, setFailed] = useState<Set<string>>(() => new Set());
 
-  const handleRefresh = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    refreshFeed(feed.id);
-  };
-
-  // Track scroll position with rAF throttling
+  // Only rows within ~1 screen of the viewport mount any images.
   useEffect(() => {
-    const container = scrollRef.current;
-    if (!container) return;
+    const el = rowRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(([entry]) => setNear(entry.isIntersecting), { rootMargin: '100% 0px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
 
-    let rafId: number | null = null;
-    let lastScrollLeft = container.scrollLeft;
-
-    const handleScroll = () => {
-      if (rafId !== null) return;
-      rafId = requestAnimationFrame(() => {
-        const newScrollLeft = container.scrollLeft;
-        if (Math.abs(newScrollLeft - lastScrollLeft) > 5) {
-          lastScrollLeft = newScrollLeft;
-          setScrollLeft(newScrollLeft);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    let last = el.scrollLeft;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (Math.abs(el.scrollLeft - last) >= 60) {
+          last = el.scrollLeft;
+          setScrollLeft(last);
         }
-        rafId = null;
       });
     };
-
-    setContainerWidth(container.offsetWidth);
-    setScrollLeft(container.scrollLeft);
-    container.addEventListener('scroll', handleScroll, { passive: true });
-
-    const resizeObserver = new ResizeObserver(() => {
-      setContainerWidth(container.offsetWidth);
-    });
-    resizeObserver.observe(container);
-
+    const ro = new ResizeObserver(() => setViewW(el.clientWidth));
+    ro.observe(el);
+    el.addEventListener('scroll', onScroll, { passive: true });
     return () => {
-      if (rafId !== null) cancelAnimationFrame(rafId);
-      container.removeEventListener('scroll', handleScroll);
-      resizeObserver.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+      el.removeEventListener('scroll', onScroll);
+      ro.disconnect();
     };
   }, []);
 
-  const handleImageLoad = useCallback((imageId: string, width: number) => {
-    setImageWidths(prev => {
-      if (prev.get(imageId) === width) return prev;
-      const next = new Map(prev);
-      next.set(imageId, width);
-      return next;
-    });
+  const list = useMemo(() => (failed.size ? images.filter(i => !failed.has(i.id)) : images), [images, failed]);
+  const { cells, width } = useMemo(() => layoutRow(list), [list]);
+
+  const visible = useMemo(() => {
+    if (!near) return [];
+    const from = scrollLeft - viewW;
+    const to = scrollLeft + viewW * 2;
+    return cells.filter(c => c.x + c.w >= from && c.x <= to).slice(0, MAX_ROW_CELLS);
+  }, [cells, near, scrollLeft, viewW]);
+
+  const lastVisible = visible.length ? visible[visible.length - 1].index : -1;
+  useEffect(() => {
+    // Only after the user actually scrolled the row, so short rows don't page on mount.
+    if (onNearEnd && scrollLeft > 0 && list.length > 0 && lastVisible >= list.length - 1) onNearEnd();
+  }, [lastVisible, list.length, onNearEnd, scrollLeft]);
+
+  const handleOpen = useCallback((image: FeedImage) => {
+    const idx = list.findIndex(i => i.id === image.id);
+    if (idx >= 0) onImageClick(image, list, idx, feed.id);
+  }, [list, onImageClick, feed.id]);
+
+  const handleFail = useCallback((id: string) => {
+    setFailed(prev => (prev.has(id) ? prev : new Set(prev).add(id)));
   }, []);
 
-  const handleImageError = useCallback((imageId: string) => {
-    setFailedImages(prev => {
-      if (prev.has(imageId)) return prev;
-      const next = new Set(prev);
-      next.add(imageId);
-      return next;
-    });
-  }, []);
-
-  // Filter out failed images and calculate positions
-  const validImages = useMemo(() => 
-    images.filter(img => !failedImages.has(img.id)),
-    [images, failedImages]
-  );
-
-  // Calculate positions and which items are visible
-  const { visibleItems, totalWidth } = useMemo(() => {
-    let x = 0;
-    const items: { image: FeedImage; index: number; x: number; width: number }[] = [];
-    
-    validImages.forEach((image, index) => {
-      // Priority: cached width > stored dimensions > square default
-      let width = imageWidths.get(image.id);
-      if (!width && image.width && image.height) {
-        width = Math.round(ROW_HEIGHT * (image.width / image.height));
+  useEffect(() => {
+    const onReveal = (e: Event) => {
+      const id = (e as CustomEvent<{ imageId: string }>).detail?.imageId;
+      const cell = cells.find(c => c.image.id === id);
+      const el = scrollRef.current;
+      if (!cell || !el) return;
+      if (cell.x < el.scrollLeft || cell.x + cell.w > el.scrollLeft + el.clientWidth) {
+        el.scrollLeft = Math.max(0, cell.x - el.clientWidth / 3);
+        setScrollLeft(el.scrollLeft);
       }
-      if (!width) width = ROW_HEIGHT; // Square default
-      
-      items.push({ image, index, x, width });
-      x += width;
-    });
-
-    const viewStart = scrollLeft - VIRTUALIZATION_BUFFER;
-    const viewEnd = scrollLeft + containerWidth + VIRTUALIZATION_BUFFER;
-
-    const visible = items.filter(item => {
-      const itemEnd = item.x + item.width;
-      return itemEnd >= viewStart && item.x <= viewEnd;
-    });
-
-    return { visibleItems: visible, totalWidth: x };
-  }, [validImages, imageWidths, scrollLeft, containerWidth]);
-
-  if (images.length === 0 && !isLoading) {
-    return (
-      <div className="mb-2">
-        <div className="flex items-center justify-between px-3 py-1">
-          <button
-            onClick={onManageFeed}
-            className="flex items-center gap-1 text-left hover:opacity-80 transition-opacity"
-          >
-            <h2 className="text-sm font-medium">{feed.title}</h2>
-            <svg className="w-3 h-3 text-[var(--color-text-muted)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
-            </svg>
-          </button>
-        </div>
-        <div className="px-3 py-4 text-center text-[var(--color-text-muted)] text-xs">
-          <p>No images found</p>
-          <button onClick={handleRefresh} className="mt-1 text-[var(--color-accent)]">
-            Refresh
-          </button>
-        </div>
-      </div>
-    );
-  }
+    };
+    window.addEventListener('picstroom:reveal', onReveal);
+    return () => window.removeEventListener('picstroom:reveal', onReveal);
+  }, [cells]);
 
   return (
-    <div className="mb-2">
-      {/* Compact header */}
-      <div className="flex items-center justify-between px-3 py-1">
-        <button
-          onClick={onManageFeed}
-          className="flex items-center gap-1 text-left hover:opacity-80 transition-opacity"
-        >
-          <h2 className="text-sm font-medium">{feed.title}</h2>
-          <span className="text-xs text-[var(--color-text-muted)]">
-            {images.length}
-          </span>
-          <svg className="w-3 h-3 text-[var(--color-text-muted)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
-          </svg>
+    <section ref={rowRef} className="ps-row" data-feed-id={feed.id}>
+      <div className="ps-row-head">
+        <button onClick={() => onManageFeed(feed)} className="ps-row-title" aria-label={`Manage ${feed.title}`}>
+          <h2>{feed.title}</h2>
+          <span className="ps-count">{images.length}</span>
+          {feed.errorMessage && <span className="ps-err" title={feed.errorMessage}>!</span>}
         </button>
-        
         <button
-          onClick={handleRefresh}
+          onClick={() => refreshFeed(feed.id)}
           disabled={isLoading}
-          className="p-1 hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50"
+          className="ps-icon-btn ps-icon-sm"
           aria-label="Refresh feed"
         >
-          <svg 
-            className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} 
-            fill="none" 
-            viewBox="0 0 24 24" 
-            stroke="currentColor" 
-            strokeWidth={2}
-          >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+          <svg className={isLoading ? 'animate-spin' : ''} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.75}>
+            <path strokeLinecap="square" d="M16.023 9.348h4.992V4.356M2.985 19.644v-4.992h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182" />
           </svg>
         </button>
       </div>
 
-      {/* Virtualized Image Row */}
-      <div 
-        ref={scrollRef} 
-        className="image-row relative"
-        style={{ height: `${ROW_HEIGHT}px` }}
-      >
-        {isLoading && images.length === 0 ? (
-          Array.from({ length: 8 }).map((_, i) => (
-            <div
-              key={i}
-              className="h-full w-[140px] bg-[var(--color-bg-tertiary)] animate-pulse flex-shrink-0"
-            />
-          ))
+      <div ref={scrollRef} className="ps-row-scroll" style={{ height: ROW_HEIGHT }}>
+        {images.length === 0 ? (
+          <div className="ps-row-empty">
+            {isLoading ? <span className="ps-spinner" /> : <button onClick={() => refreshFeed(feed.id)}>No images · Refresh</button>}
+          </div>
         ) : (
-          <div style={{ width: totalWidth, height: ROW_HEIGHT, position: 'relative' }}>
-            {visibleItems.map((item) => (
-              <VirtualizedImageCard
-                key={item.image.id}
-                image={item.image}
-                x={item.x}
-                width={item.width}
-                onClick={() => onImageClick(item.image, validImages, item.index, feed.id)}
-                onWidthKnown={handleImageLoad}
-                onError={handleImageError}
+          <div style={{ width, height: ROW_HEIGHT, position: 'relative' }}>
+            {visible.map(cell => (
+              <Thumb
+                key={cell.image.id}
+                image={cell.image}
+                cssWidth={cell.w}
+                useProxy={useProxy}
+                style={{ left: cell.x, top: 0, width: cell.w, height: ROW_HEIGHT }}
+                onOpen={handleOpen}
+                onFail={handleFail}
               />
             ))}
           </div>
         )}
       </div>
-    </div>
+    </section>
   );
-}
-
-interface VirtualizedImageCardProps {
-  image: FeedImage;
-  x: number;
-  width: number;
-  onClick: () => void;
-  onWidthKnown: (imageId: string, width: number) => void;
-  onError: (imageId: string) => void;
-}
-
-function VirtualizedImageCard({ image, x, width, onClick, onWidthKnown, onError }: VirtualizedImageCardProps) {
-  const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState(false);
-
-  const handleLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
-    const img = e.currentTarget;
-    const { naturalWidth, naturalHeight } = img;
-    if (naturalWidth && naturalHeight) {
-      const calculatedWidth = Math.round(ROW_HEIGHT * (naturalWidth / naturalHeight));
-      onWidthKnown(image.id, calculatedWidth);
-    }
-    setLoaded(true);
-  };
-
-  const handleError = () => {
-    setError(true);
-    onError(image.id);
-  };
-
-  if (error) return null;
-
-  return (
-    <div
-      onClick={onClick}
-      className="absolute top-0 overflow-hidden cursor-pointer bg-[var(--color-bg-tertiary)]"
-      style={{
-        left: x,
-        width: width,
-        height: ROW_HEIGHT,
-        transform: 'translateZ(0)'
-      }}
-    >
-      <img
-        src={image.thumbnailUrl || image.url}
-        alt={image.title || 'Image'}
-        onLoad={handleLoad}
-        onError={handleError}
-        loading="lazy"
-        decoding="async"
-        className={`w-full h-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`}
-      />
-
-      {!loaded && !error && (
-        <div className="absolute inset-0 animate-pulse bg-[var(--color-bg-tertiary)]" />
-      )}
-    </div>
-  );
-}
+});
