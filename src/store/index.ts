@@ -7,6 +7,8 @@ import {
   saveSettings,
   getFeeds,
   saveFeed,
+  saveFeeds,
+  requestPersistentStorage,
   deleteFeed as deleteFeedFromDB,
   getAllImages,
   upsertImages,
@@ -34,6 +36,15 @@ import {
   type PageOutcome
 } from '../lib/collections';
 import { logDiag } from '../lib/diagnostics';
+import { normalizeFeedOrder, moveFeed } from '../lib/feed-order';
+import { importableSettings, type ImportPlan } from '../lib/backup';
+
+export interface ImportResult {
+  added: number;
+  skipped: number;
+  failed: number;
+  favorites: number;
+}
 
 export type OlderStatus = 'idle' | 'loading' | 'waiting' | 'end';
 
@@ -67,6 +78,7 @@ interface AppState {
   refreshFeed: (feedId: string) => Promise<void>;
   refreshAllFeeds: () => Promise<void>;
   reorderFeed: (feedId: string, newIndex: number) => Promise<void>;
+  importData: (plan: ImportPlan, onProgress?: (done: number, total: number) => void) => Promise<ImportResult>;
 
   addFolder: (name: string) => Promise<Folder>;
   updateFolder: (folderId: string, updates: Partial<Folder>) => Promise<void>;
@@ -157,13 +169,18 @@ export const useStore = create<AppState>((set, get) => {
     initialize: async () => {
       try {
         await initDB();
-        const [settings, feeds, folders, favorites, images] = await Promise.all([
+        const [settings, storedFeeds, folders, favorites, images] = await Promise.all([
           getSettings(),
           getFeeds(),
           getFolders(),
           getFavorites(),
           getAllImages()
         ]);
+
+        // Older versions could leave gaps/duplicates in `order`; make it explicit (same
+        // visible order) so reordering is well defined.
+        const { feeds, changed: reordered } = normalizeFeedOrder(storedFeeds);
+        if (reordered.length) saveFeeds(reordered).catch(e => logDiag('warn', 'Saving feed order failed', e));
 
         const feedIds = new Set(feeds.map(f => f.id));
         const grouped: Record<string, FeedImage[]> = {};
@@ -191,6 +208,7 @@ export const useStore = create<AppState>((set, get) => {
           allImages: rebuildAll(imagesByFeed)
         });
         applyTheme(settings.theme);
+        requestPersistentStorage().then(p => logDiag('info', `Persistent storage: ${p ?? 'n/a'}`));
 
         if (orphanIds.length || prunedIds.length) {
           // Housekeeping off the critical path.
@@ -371,7 +389,13 @@ export const useStore = create<AppState>((set, get) => {
           return;
         }
         await mergeIntoFeed(feedId, buildFeedImages(res.parsed, feed));
-        await get().updateFeed(feedId, { lastFetched: Date.now(), errorMessage: undefined });
+        const current = get().feeds.find(f => f.id === feedId);
+        await get().updateFeed(feedId, {
+          lastFetched: Date.now(),
+          errorMessage: undefined,
+          // Feeds imported from a bare URL list get their real name on first load.
+          ...(current?.autoTitle && res.parsed.title ? { title: res.parsed.title, siteUrl: current.siteUrl || res.parsed.siteUrl, autoTitle: undefined } : {})
+        });
       } catch (error) {
         logDiag('warn', `Refresh ${feed.title} failed`, error);
         await get().updateFeed(feedId, { errorMessage: 'Refresh failed' });
@@ -402,17 +426,92 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     reorderFeed: async (feedId, newIndex) => {
-      const { feeds } = get();
-      const currentIndex = feeds.findIndex(f => f.id === feedId);
-      if (currentIndex === -1 || currentIndex === newIndex) return;
-      const newFeeds = [...feeds];
-      const [removed] = newFeeds.splice(currentIndex, 1);
-      newFeeds.splice(newIndex, 0, removed);
-      for (let i = 0; i < newFeeds.length; i++) {
-        newFeeds[i] = { ...newFeeds[i], order: i };
+      const next = moveFeed(get().feeds, feedId, newIndex);
+      if (!next) return;
+      set({ feeds: next });
+      try {
+        await saveFeeds(next);
+      } catch (e) {
+        logDiag('error', 'Saving feed order failed', e);
       }
-      set({ feeds: newFeeds });
-      for (const f of newFeeds) await saveFeed(f);
+    },
+
+    importData: async (plan, onProgress) => {
+      const result: ImportResult = { added: 0, skipped: 0, failed: 0, favorites: 0 };
+      const total = plan.feeds.length;
+      let done = 0;
+      const tick = () => onProgress?.(++done, total);
+
+      // Folders by name (reuse existing ones).
+      const folderIdByName = new Map(get().folders.map(f => [f.name, f.id]));
+      for (const name of plan.folders) {
+        if (!name || folderIdByName.has(name)) continue;
+        const folder = await get().addFolder(name);
+        folderIdByName.set(name, folder.id);
+      }
+
+      if (plan.kind === 'urls') {
+        // Bare addresses may be web pages: go through addFeed (discovery + validation), in order.
+        for (const f of plan.feeds) {
+          if (get().feeds.some(x => x.url === f.url)) { result.skipped++; tick(); continue; }
+          const added = await get().addFeed(f.url);
+          if (added) result.added++; else result.failed++;
+          tick();
+        }
+        set({ error: null });
+      } else {
+        const existing = new Set(get().feeds.map(f => f.url));
+        const base = get().feeds.length;
+        const fresh: Feed[] = [];
+        for (const f of plan.feeds) {
+          if (existing.has(f.url)) { result.skipped++; continue; }
+          existing.add(f.url);
+          let host = f.url;
+          try { host = new URL(f.url).hostname.replace(/^www\./, ''); } catch { /* keep url */ }
+          fresh.push({
+            id: uuid(),
+            url: f.url,
+            title: f.title || host,
+            autoTitle: f.title ? undefined : true,
+            siteUrl: f.siteUrl,
+            description: f.description,
+            folderId: f.folderName ? folderIdByName.get(f.folderName) : undefined,
+            order: base + fresh.length
+          });
+        }
+        if (fresh.length) {
+          await saveFeeds(fresh);
+          set(state => {
+            const imagesByFeed = { ...state.imagesByFeed };
+            for (const f of fresh) imagesByFeed[f.id] = [];
+            return { feeds: [...state.feeds, ...fresh], imagesByFeed, olderStatus: 'idle' };
+          });
+        }
+        result.added = fresh.length;
+        done = total;
+        onProgress?.(done, total);
+        if (plan.settings) {
+          const s = importableSettings(plan.settings);
+          if (Object.keys(s).length) await get().updateSettings(s);
+        }
+        // Load the new feeds in the background.
+        if (fresh.length) {
+          runLimited(fresh, 3, f => get().refreshFeed(f.id)).catch(e => logDiag('warn', 'Import refresh failed', e));
+        }
+      }
+
+      const favIds = get().favoriteIds;
+      const newFavs = plan.favorites.filter(f => !favIds.has(f.imageId));
+      if (newFavs.length) {
+        set(state => ({
+          favorites: [...state.favorites, ...newFavs].sort((a, b) => b.savedAt - a.savedAt),
+          favoriteIds: new Set([...state.favoriteIds, ...newFavs.map(f => f.imageId)])
+        }));
+        for (const f of newFavs) await addFavorite(f);
+        result.favorites = newFavs.length;
+      }
+      logDiag('info', `Import (${plan.kind}): ${JSON.stringify(result)}`);
+      return result;
     },
 
     addFolder: async (name) => {

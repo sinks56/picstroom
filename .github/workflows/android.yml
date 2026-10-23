@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # SHA-256 of the PicStroom signing certificate (public). Every APK must match it, or
+  # it could not be installed over the previous version without wiping the app's data.
+  PICSTROOM_CERT_SHA256: 67ee682b67692f56c5a333d37f0e5db97b2fefdfb4c22d0dc1d9ad05e4bb4344
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -46,21 +51,39 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x android/gradlew
 
-      - name: Build debug APK
+      - name: Restore signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.PICSTROOM_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then echo "::error::PICSTROOM_KEYSTORE_B64 secret missing"; exit 1; fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/picstroom.p12"
+          echo "PICSTROOM_KEYSTORE=$RUNNER_TEMP/picstroom.p12" >> "$GITHUB_ENV"
+
+      - name: Build APK (signed with the stable key)
+        env:
+          PICSTROOM_KEYSTORE_PASSWORD: ${{ secrets.PICSTROOM_KEYSTORE_PASSWORD }}
         run: |
           cd android
           ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/PicStroom.apk"
+          rm -f "$PICSTROOM_KEYSTORE"
+
+      - name: Verify signing certificate
+        run: |
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner
+          "$APKSIGNER" verify --print-certs PicStroom.apk | tee certs.txt
+          grep -qi "SHA-256 digest: $PICSTROOM_CERT_SHA256" certs.txt || { echo "::error::APK is not signed with the PicStroom key"; exit 1; }
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: picstroom-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: picstroom-apk
+          path: PicStroom.apk
 
       - name: Upload APK to Release
         if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: android/app/build/outputs/apk/debug/app-debug.apk
+          files: PicStroom.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

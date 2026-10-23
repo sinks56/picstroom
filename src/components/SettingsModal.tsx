@@ -2,8 +2,11 @@ import { useState, useRef, useSyncExternalStore } from 'react';
 import { getDiagnostics, subscribeDiagnostics, clearDiagnostics, diagnosticsReport } from '../lib/diagnostics';
 import { Modal } from './Modal';
 import { useStore } from '../store';
-import { exportToOPML, parseOPML } from '../lib/storage';
+import { exportToOPML } from '../lib/storage';
 import { DEFAULT_PROXIES } from '../lib/cors-proxy';
+import { buildBackup, parseImport } from '../lib/backup';
+import { saveTextFile, copyText } from '../lib/share-file';
+import { FeedReorderList } from './FeedReorderList';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -11,55 +14,84 @@ interface SettingsModalProps {
 }
 
 export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
-  const { settings, updateSettings, feeds, folders, addFeed, addFolder, removeFeed } = useStore();
+  const { settings, updateSettings, feeds, folders, favorites, removeFeed, reorderFeed, importData } = useStore();
   const [activeTab, setActiveTab] = useState<'appearance' | 'feeds' | 'proxy' | 'data'>('appearance');
-  const [importing, setImporting] = useState(false);
+  const [importing, setImporting] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleThemeChange = (theme: 'light' | 'dark' | 'system') => {
     updateSettings({ theme });
   };
 
-  const handleExportOPML = () => {
-    const opml = exportToOPML(feeds, folders);
-    const blob = new Blob([opml], { type: 'text/xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'picstroom-feeds.opml';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const stamp = () => new Date().toISOString().slice(0, 10);
+  const backupText = () => JSON.stringify(buildBackup({ settings, feeds, folders, favorites }, __APP_VERSION__), null, 2);
+
+  const flash = (msg: string) => {
+    setStatus(msg);
+    setTimeout(() => setStatus(s => (s === msg ? null : s)), 6000);
   };
 
-  const handleImportOPML = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setImporting(true);
+  const handleExportBackup = async () => {
     try {
-      const text = await file.text();
-      const { feeds: importedFeeds, folders: importedFolders } = parseOPML(text);
+      const r = await saveTextFile(`picstroom-backup-${stamp()}.json`, backupText(), 'application/json');
+      if (r !== 'cancelled') flash(`Backup with ${feeds.length} feeds ${r === 'shared' ? 'ready to save' : 'downloaded'}`);
+    } catch (e) {
+      flash(`Could not save the file (${(e as Error)?.message || e}). Use Copy instead.`);
+    }
+  };
 
-      // Add folders
-      for (const folder of importedFolders) {
-        await addFolder(folder.name);
-      }
+  const handleCopyBackup = async () => {
+    flash((await copyText(backupText())) ? `Backup copied (${feeds.length} feeds). Paste it somewhere safe.` : 'Copy failed');
+  };
 
-      // Add feeds
-      for (const feed of importedFeeds) {
-        await addFeed(feed.url, feed.title);
-      }
+  const handleExportOPML = async () => {
+    try {
+      const r = await saveTextFile(`picstroom-feeds-${stamp()}.opml`, exportToOPML(feeds, folders), 'text/x-opml');
+      if (r !== 'cancelled') flash(`OPML with ${feeds.length} feeds ${r === 'shared' ? 'ready to save' : 'downloaded'}`);
+    } catch (e) {
+      flash(`Could not save the file (${(e as Error)?.message || e})`);
+    }
+  };
 
-      alert(`Imported ${importedFeeds.length} feeds and ${importedFolders.length} folders`);
-    } catch (error) {
-      alert('Failed to import OPML file');
+  const runImport = async (text: string) => {
+    let plan;
+    try {
+      plan = parseImport(text);
+    } catch (e) {
+      flash((e as Error).message || 'Nothing to import');
+      return false;
+    }
+    setImporting(`Importing 0/${plan.feeds.length}`);
+    try {
+      const r = await importData(plan, (d, t) => setImporting(`Importing ${d}/${t}`));
+      const parts = [`${r.added} feed${r.added === 1 ? '' : 's'} added`];
+      if (r.skipped) parts.push(`${r.skipped} already there`);
+      if (r.failed) parts.push(`${r.failed} failed`);
+      if (r.favorites) parts.push(`${r.favorites} favorites`);
+      flash(parts.join(', '));
+      return true;
+    } catch (e) {
+      flash(`Import failed: ${(e as Error)?.message || e}`);
+      return false;
     } finally {
-      setImporting(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+      setImporting(null);
+    }
+  };
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!file) return;
+    await runImport(await file.text());
+  };
+
+  const handleImportPaste = async () => {
+    if (await runImport(pasteText)) {
+      setPasteText('');
+      setPasteOpen(false);
     }
   };
 
@@ -181,34 +213,18 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         )}
 
         {activeTab === 'feeds' && (
-          <div className="space-y-4">
+          <div className="-mx-6 -mt-6">
             {feeds.length === 0 ? (
               <p className="text-[var(--color-text-muted)] text-center py-8">
                 No feeds added yet
               </p>
             ) : (
-              <div className="space-y-2">
-                {feeds.map((feed) => (
-                  <div
-                    key={feed.id}
-                    className="flex items-center justify-between p-4 rounded-xl bg-[var(--color-bg-secondary)]"
-                  >
-                    <div className="flex-1 min-w-0">
-                      <h4 className="font-medium truncate">{feed.title}</h4>
-                      <p className="text-sm text-[var(--color-text-muted)] truncate">{feed.url}</p>
-                    </div>
-                    <button
-                      onClick={() => removeFeed(feed.id)}
-                      className="ml-4 p-2 rounded-lg hover:bg-red-500/10 text-red-500 transition-colors"
-                      aria-label="Delete feed"
-                    >
-                      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
-                      </svg>
-                    </button>
-                  </div>
-                ))}
-              </div>
+              <>
+                <p className="px-4 py-2.5 text-xs text-[var(--color-text-muted)]">
+                  Drag <span aria-hidden="true">≡</span> or long-press a feed to move it. This is the order of the rows on the home screen.
+                </p>
+                <FeedReorderList feeds={feeds} onMove={reorderFeed} onRemove={removeFeed} />
+              </>
             )}
           </div>
         )}
@@ -265,29 +281,50 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
         {activeTab === 'data' && (
           <div className="space-y-6">
-            <div>
-              <h3 className="text-sm font-medium mb-3">Import / Export</h3>
-              <div className="flex gap-3">
-                <button
-                  onClick={handleExportOPML}
-                  disabled={feeds.length === 0}
-                  className="flex-1 px-4 py-3 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] transition-colors font-medium disabled:opacity-50"
-                >
-                  Export OPML
+            <div data-testid="backup">
+              <h3 className="text-sm font-medium mb-1">Backup</h3>
+              <p className="text-xs text-[var(--color-text-muted)] mb-3">
+                Feeds (in your order), folders, favorites and settings. Keep a copy before reinstalling the app or moving to another device.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={handleExportBackup} disabled={feeds.length === 0} className="px-3 py-2.5 border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] text-sm font-medium disabled:opacity-50">
+                  Export feeds &amp; settings
                 </button>
-                <label className="flex-1">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".opml,.xml"
-                    onChange={handleImportOPML}
-                    className="hidden"
-                  />
-                  <span className="block px-4 py-3 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] transition-colors font-medium text-center cursor-pointer">
-                    {importing ? 'Importing...' : 'Import OPML'}
-                  </span>
+                <button onClick={handleCopyBackup} disabled={feeds.length === 0} className="px-3 py-2.5 border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] text-sm font-medium disabled:opacity-50">
+                  Copy backup
+                </button>
+                <label className="px-3 py-2.5 border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] text-sm font-medium disabled:opacity-50 text-center cursor-pointer">
+                  <input ref={fileInputRef} type="file" onChange={handleImportFile} className="hidden" data-testid="import-file" />
+                  Import file
                 </label>
+                <button onClick={() => setPasteOpen(o => !o)} className="px-3 py-2.5 border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] text-sm font-medium disabled:opacity-50">
+                  Paste to import
+                </button>
               </div>
+              {pasteOpen && (
+                <div className="mt-2">
+                  <textarea
+                    value={pasteText}
+                    onChange={e => setPasteText(e.target.value)}
+                    placeholder="Paste a PicStroom backup, an OPML file, or feed addresses (one per line)"
+                    rows={5}
+                    data-testid="import-paste"
+                    className="w-full p-2 text-xs font-mono bg-[var(--color-bg-secondary)] border border-[var(--color-border)] focus:outline-none"
+                  />
+                  <button onClick={handleImportPaste} disabled={!pasteText.trim() || !!importing} className="w-full px-3 py-2.5 border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] text-sm font-medium disabled:opacity-50">
+                    Import
+                  </button>
+                </div>
+              )}
+              <button onClick={handleExportOPML} disabled={feeds.length === 0} className="mt-2 text-xs text-[var(--color-text-secondary)] underline disabled:opacity-50">
+                Export OPML (for other RSS readers)
+              </button>
+              {(importing || status) && (
+                <p className="mt-2 text-xs" role="status" data-testid="backup-status">{importing || status}</p>
+              )}
+              <p className="mt-2 text-[11px] text-[var(--color-text-muted)]">
+                Import accepts a backup file, OPML, or a plain list of feed links. Feeds you already have are skipped. Cached images are not in the backup; they reload.
+              </p>
             </div>
 
             <div>

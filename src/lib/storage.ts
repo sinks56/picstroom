@@ -18,6 +18,18 @@ interface PicStroomDB {
 
 let db: IDBPDatabase<any> | null = null;
 
+/**
+ * Schema policy (keeps user data across updates):
+ * - DB_VERSION only ever goes up; `upgrade` only creates missing stores/indexes and
+ *   migrates records in place. It never deletes a store or clears data.
+ * - New optional fields get defaults at read time (see getSettings / normalizeFeedOrder),
+ *   so older records stay valid without a schema bump.
+ */
+export function closeDB() {
+  db?.close();
+  db = null;
+}
+
 export async function initDB(): Promise<IDBPDatabase<any>> {
   if (db) return db;
 
@@ -75,6 +87,10 @@ export async function initDB(): Promise<IDBPDatabase<any>> {
           }
         }
       }
+    },
+    blocking() {
+      // A newer version (another tab) wants to upgrade: let it.
+      closeDB();
     }
   });
 
@@ -116,6 +132,30 @@ export async function getFeeds(): Promise<Feed[]> {
 export async function saveFeed(feed: Feed): Promise<void> {
   const database = await initDB();
   await database.put('feeds', feed);
+}
+
+/** Save several feeds in one transaction (used for reordering / import). */
+export async function saveFeeds(feeds: Feed[]): Promise<void> {
+  if (!feeds.length) return;
+  const database = await initDB();
+  const tx = database.transaction('feeds', 'readwrite');
+  for (const feed of feeds) tx.store.put(feed);
+  await tx.done;
+}
+
+/**
+ * Ask the browser not to evict our IndexedDB under storage pressure (web/PWA). Android's
+ * WebView keeps app data until uninstall regardless; there this is a harmless no-op.
+ */
+export async function requestPersistentStorage(): Promise<boolean | undefined> {
+  try {
+    const storage = navigator.storage;
+    if (!storage?.persist) return undefined;
+    if (await storage.persisted?.()) return true;
+    return await storage.persist();
+  } catch {
+    return undefined;
+  }
 }
 
 export async function deleteFeed(feedId: string): Promise<void> {

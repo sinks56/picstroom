@@ -20,7 +20,10 @@ export interface Feed {
   description?: string;
   favicon?: string;
   folderId?: string;
+  /** Position in the user's feed list (0-based, unique). */
   order: number;
+  /** Title is a placeholder (hostname) until the feed is first loaded. */
+  autoTitle?: boolean;
   lastFetched?: number;
   errorMessage?: string;
   lastFetchedPage?: number;

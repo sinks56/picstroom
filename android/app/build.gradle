@@ -7,8 +7,8 @@ android {
         applicationId "io.github.sinks56.picstroom"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 8
-        versionName "1.4.0"
+        versionCode 9
+        versionName "1.5.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,7 +16,25 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    // One stable signing key for every build (CI restores it from secrets), so new APKs
+    // install over old ones and keep the app's data. Without the env vars (local builds)
+    // Gradle falls back to the machine's own debug key.
+    def stableKeystore = System.getenv("PICSTROOM_KEYSTORE")
+    signingConfigs {
+        stable {
+            if (stableKeystore) {
+                storeFile file(stableKeystore)
+                storeType "pkcs12"
+                storePassword System.getenv("PICSTROOM_KEYSTORE_PASSWORD")
+                keyAlias "picstroom"
+                keyPassword System.getenv("PICSTROOM_KEYSTORE_PASSWORD")
+            }
+        }
+    }
     buildTypes {
+        debug {
+            if (stableKeystore) signingConfig signingConfigs.stable
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
