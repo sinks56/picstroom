@@ -48,7 +48,7 @@ export default defineConfig({
         runtimeCaching: [
           {
             // Resized thumbnails (CORS, small WebP): bounded LRU cache so the grid works offline.
-            urlPattern: /^https:\/\/wsrv\.nl\/\?/i,
+            urlPattern: /^https:\/\/(wsrv\.nl\/\?|i[0-3]\.wp\.com\/.*[?&]w=\d+)/i,
             handler: 'CacheFirst',
             options: {
               cacheName: 'thumbs-v1',

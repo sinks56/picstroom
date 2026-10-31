@@ -25,8 +25,31 @@ function stripProtocol(url: string): string {
   return url.replace(/^https?:\/\//i, '');
 }
 
+/**
+ * WordPress/Jetpack's own image CDN (i0/i1/i2.wp.com). It resizes by itself (?w=), answers
+ * with CORS headers, and wsrv.nl refuses to proxy it ("Domain blocked by policy"), so it is
+ * resized in place instead of going through wsrv.nl.
+ */
+export function isJetpackCdn(url: string): boolean {
+  return /^https?:\/\/i[0-3]\.wp\.com\//i.test(url);
+}
+
+function jetpackResized(url: string, width: number, quality: number): string {
+  try {
+    const u = new URL(url);
+    for (const k of ['resize', 'fit', 'crop', 'h', 'w', 'width', 'height', 'quality']) u.searchParams.delete(k);
+    u.searchParams.set('w', String(width));
+    u.searchParams.set('quality', String(quality));
+    u.searchParams.set('ssl', '1');
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
 export function resizedUrl(url: string, width: number, quality = 72): string {
   if (!/^https?:\/\//i.test(url)) return url; // data:, blob:, relative: leave untouched
+  if (isJetpackCdn(url)) return jetpackResized(url, width, quality);
   const params = new URLSearchParams({
     url: stripProtocol(url),
     w: String(width),
@@ -74,5 +97,5 @@ export const loadedSources = new Set<string>();
  * Originals stay no-cors: many hosts don't send CORS headers.
  */
 export function corsFor(src: string): 'anonymous' | undefined {
-  return src.startsWith(THUMB_PROXY) ? 'anonymous' : undefined;
+  return src.startsWith(THUMB_PROXY) || isJetpackCdn(src) ? 'anonymous' : undefined;
 }

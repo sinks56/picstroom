@@ -134,6 +134,43 @@ export function nextMultiplierRevealingOlder(images: Pick<FeedImage, 'pubDate' |
   return Math.max(multiplier + 1, chunks);
 }
 
+/** A feed always shows at least this many of its newest pictures, however old. */
+export const MIN_VISIBLE_PER_FEED = 24;
+
+/**
+ * Time-window multiplier to actually use for `images`: the requested one, widened (in
+ * 14-day chunks, jumping over empty ones) until at least `minCount` pictures are visible
+ * or nothing older is left. Without this a feed that posts rarely (newest post older than
+ * the window) renders as "No images" even though its pictures are stored.
+ */
+export function effectiveMultiplier(
+  images: Pick<FeedImage, 'pubDate' | 'fetchedAt'>[],
+  multiplier: number,
+  minCount = MIN_VISIBLE_PER_FEED,
+  now = Date.now()
+): number {
+  let m = Math.max(1, multiplier);
+  if (images.length === 0) return m;
+  const cutoffOf = (mm: number) => windowCutoff(mm, now);
+  for (let guard = 0; guard < 1000; guard++) {
+    const cutoff = cutoffOf(m);
+    let visible = 0;
+    for (const img of images) if (imageDate(img) >= cutoff) visible++;
+    if (visible >= minCount) return m;
+    const next = nextMultiplierRevealingOlder(images, m, now);
+    if (next === null) return m;
+    m = next;
+  }
+  return m;
+}
+
+/** Window filter that never leaves a quiet feed empty (see effectiveMultiplier). */
+export function filterByTimeWindowMin<T extends Pick<FeedImage, 'pubDate' | 'fetchedAt'>>(
+  images: T[], multiplier: number, minCount = MIN_VISIBLE_PER_FEED, now = Date.now()
+): T[] {
+  return filterByTimeWindow(images, effectiveMultiplier(images, multiplier, minCount, now), now);
+}
+
 /**
  * Limit how many images one post contributes to the combined grid so a single article
  * with 50 pictures can't fill several screens. Order is preserved.

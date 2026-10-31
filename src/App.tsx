@@ -14,7 +14,7 @@ import { DiscoverModal } from './components/DiscoverModal';
 import { FeedManageModal } from './components/FeedManageModal';
 import { EmptyState } from './components/EmptyState';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { filterByTimeWindow, capPerPost } from './lib/collections';
+import { filterByTimeWindowMin, capPerPost } from './lib/collections';
 import { logDiag } from './lib/diagnostics';
 
 interface ViewerState {
@@ -47,13 +47,13 @@ export default function App() {
   // Recompute the time window when the clock crosses into a new hour, not on every render.
   const hourBucket = Math.floor(Date.now() / 3_600_000);
   const gridImages = useMemo(
-    () => capPerPost(filterByTimeWindow(allImages, multiplier), maxPerPost),
+    () => capPerPost(filterByTimeWindowMin(allImages, multiplier), maxPerPost),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [allImages, multiplier, maxPerPost, hourBucket]
   );
   const rowImages = useMemo(() => {
     const out: Record<string, FeedImage[]> = {};
-    for (const [id, imgs] of Object.entries(imagesByFeed)) out[id] = filterByTimeWindow(imgs, multiplier);
+    for (const [id, imgs] of Object.entries(imagesByFeed)) out[id] = filterByTimeWindowMin(imgs, multiplier);
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imagesByFeed, multiplier, hourBucket]);
