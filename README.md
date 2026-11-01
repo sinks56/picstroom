@@ -20,6 +20,18 @@ A Progressive Web App recreation of PicStroom, the beloved iPad app (c. 2011-201
 - **Dark/Light Themes**: Matches your system preference or set manually
 - **Works Everywhere**: Pure static site that can be hosted anywhere
 
+## Android home-screen widgets (v1.6.0)
+
+The Android app ships three resizable widgets (long-press the home screen, Widgets, PicStroom):
+
+- **PicStroom: Favourites** shows your saved pictures.
+- **PicStroom: Random** shows random pictures from all your feeds.
+- **PicStroom: Random from feeds** shows random pictures from the feeds you tick.
+
+Each widget has its own settings screen (long-press the widget, Settings): 1 to 5 pictures as a collage (Feature or Even layout, adapts to wide and tall sizes), refresh interval (15 min to daily, or manual), what a tap does (open the picture, shuffle, open the app), feed-name captions, fill or fit, shuffle button, Wi-Fi only, and only pictures from the last 1/7/30/90 days.
+
+How it works: the app writes a small snapshot of your feeds and favourites to native storage whenever they change (`src/lib/widget-sync.ts`, `WidgetBridge` plugin). The widgets draw the collage in one bitmap (`CollageRenderer`), fetch feeds natively every 6 hours (`FeedSyncWorker`) and refresh through WorkManager, so they work with the app closed. Tapping a picture opens it in the viewer through a `picstroom://image` link. The collage layouts live in `CollageLayout.java`; `scripts/gen-widget-layouts.py` generates the matching tap-target layouts from it. `WidgetRenderTest` renders the real widget code on the JVM; add `-Dpicstroom.shots=DIR -Dpicstroom.samples=DIR` to also write preview PNGs.
+
 ## Install on iPad
 
 PicStroom is a Progressive Web App (PWA) that can be installed on your iPad home screen for a native app-like experience.

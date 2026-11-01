@@ -16,6 +16,8 @@ import { EmptyState } from './components/EmptyState';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { filterByTimeWindowMin, capPerPost } from './lib/collections';
 import { logDiag } from './lib/diagnostics';
+import { startWidgetSync } from './lib/widget-sync';
+import { parseWidgetLink, resolveWidgetImage } from './lib/widget-link';
 
 interface ViewerState {
   images: FeedImage[];
@@ -102,6 +104,38 @@ export default function App() {
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, [finishClose]);
+
+  // ---- Home-screen widgets: keep the native snapshot in sync, open pictures tapped there ----
+  useEffect(() => (initialized ? startWidgetSync() : undefined), [initialized]);
+
+  const lastLinkRef = useRef({ url: '', at: 0 });
+  const handleLinkRef = useRef((_url: string) => {});
+  handleLinkRef.current = (url: string) => {
+    const link = parseWidgetLink(url);
+    if (!link) return;
+    const now = Date.now();
+    if (lastLinkRef.current.url === url && now - lastLinkRef.current.at < 1500) return;
+    lastLinkRef.current = { url, at: now };
+    const st = useStore.getState();
+    const known = [...st.allImages, ...st.favorites.map(f => ({
+      id: f.imageId, feedId: f.feedId, url: f.url, thumbnailUrl: f.thumbnailUrl,
+      sourceUrl: f.sourceUrl, title: f.title, fetchedAt: f.savedAt
+    }))];
+    const img = resolveWidgetImage(link, known);
+    if (img) openViewer(img, [img], 0);
+  };
+  useEffect(() => {
+    if (!initialized) return;
+    let remove: (() => void) | undefined;
+    let disposed = false;
+    CapacitorApp.getLaunchUrl()
+      .then(r => { if (r?.url) handleLinkRef.current(r.url); })
+      .catch(() => {});
+    CapacitorApp.addListener('appUrlOpen', e => handleLinkRef.current(e.url))
+      .then(h => { if (disposed) h.remove(); else remove = () => h.remove(); })
+      .catch(e => logDiag('info', 'appUrlOpen listener unavailable', e));
+    return () => { disposed = true; remove?.(); };
+  }, [initialized]);
 
   // ---- Android back button: viewer → modal → minimize ---------------------------------
   const stateRef = useRef({ viewer, addFeedOpen, settingsOpen, favoritesOpen, discoverOpen, manageFeed });

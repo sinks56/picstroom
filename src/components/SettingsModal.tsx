@@ -1,4 +1,5 @@
 import { useState, useRef, useSyncExternalStore } from 'react';
+import { Capacitor } from '@capacitor/core';
 import { getDiagnostics, subscribeDiagnostics, clearDiagnostics, diagnosticsReport } from '../lib/diagnostics';
 import { Modal } from './Modal';
 import { useStore } from '../store';
@@ -209,6 +210,16 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 </select>
               </label>
             </div>
+
+            {Capacitor.isNativePlatform() && (
+              <div>
+                <h3 className="text-sm font-medium mb-1">Home screen widgets</h3>
+                <p className="text-xs text-[var(--color-text-muted)]">
+                  Long-press an empty spot on your home screen, choose Widgets, then PicStroom: Favourites, Random or Random from feeds.
+                  Long-press a widget and pick Settings to change its look.
+                </p>
+              </div>
+            )}
           </div>
         )}
 
